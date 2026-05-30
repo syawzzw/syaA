@@ -251,6 +251,9 @@ def _append_auto_fields(sql, val, action=None):
     """对 UPDATE av 语句自动追加 updated_at = 当前时间 和 last_action = 动作，返回 (新sql, 新val)。
     如果语句已包含 updated_at 或不是 UPDATE av，则原样返回。
     action: 可选的动作标签字符串，如 "评分"、"删除"、"移动" 等。
+
+    注意：新字段插入在 WHERE 之前的 SET 子句中，因此对应的参数值也必须
+    插在原 val 中 SET 参数之后、WHERE 参数之前，而非简单追加到末尾。
     """
     if not sql.strip().upper().startswith("UPDATE AV "):
         return sql, val
@@ -259,13 +262,19 @@ def _append_auto_fields(sql, val, action=None):
     sql_upper = sql.upper()
     where_pos = sql_upper.rfind(" WHERE ")
     if where_pos > 0:
+        # 计算原 SQL 中 SET 部分有多少个 ?（即在 WHERE 之前的 ? 数量）
+        set_part = sql[:where_pos]
+        set_placeholder_count = set_part.count("?")
         additions = ", updated_at = ?"
         add_vals = [time.strftime("%Y-%m-%d %H:%M:%S")]
         if action:
             additions += ", last_action = ?"
             add_vals.append(action)
         sql = sql[:where_pos] + additions + sql[where_pos:]
-        val = tuple(list(val) + add_vals)
+        # 将新增参数插到 SET 参数之后、WHERE 参数之前
+        val_list = list(val)
+        new_val = val_list[:set_placeholder_count] + add_vals + val_list[set_placeholder_count:]
+        val = tuple(new_val)
     return sql, val
 
 

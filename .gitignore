@@ -24,8 +24,9 @@ src/url/output/
 # 可执行文件
 *.exe
 
-# WorkBuddy
-.workbuddy/
+# WorkBuddy（保留 memory 目录，便于跨设备同步工作上下文）
+.workbuddy/*
+!.workbuddy/memory/
 
 # 日志
 *.log
