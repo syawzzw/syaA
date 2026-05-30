@@ -10,8 +10,7 @@ __pycache__/
 dist/
 build/
 
-# 数据库（含用户数据，不应提交）
-*.db
+# 数据库临时文件（syaA.db 本身需要提交，以同步数据到其他设备）
 *.db-journal
 *.db-wal
 

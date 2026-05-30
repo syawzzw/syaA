@@ -1969,9 +1969,15 @@ class SyaApp:
             self.cur_video["grade"] = 10
             self._update_video_info("路径不可达，已更新数据库，评分设为10")
             return
-        # 使用 subprocess 替代 os.startfile，避免 GIL 崩溃
+        # 跨平台打开文件：Windows 用 cmd start，macOS 用 open，Linux 用 xdg-open
         import subprocess
-        subprocess.Popen(["cmd", "/c", "start", "", path], shell=False)
+        import sys
+        if sys.platform == "win32":
+            subprocess.Popen(["cmd", "/c", "start", "", path], shell=False)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], shell=False)
+        else:
+            subprocess.Popen(["xdg-open", path], shell=False)
 
     def _grade_video(self):
         try:
@@ -2908,13 +2914,23 @@ class SyaApp:
         except ImportError:
             self._log("[MySQL迁移] 未安装 pymysql，请先：pip install pymysql")
             return
+        # 从环境变量读取 MySQL 连接信息，避免密码硬编码到公开仓库
+        mysql_user = os.environ.get("SYAA_MYSQL_USER", "root")
+        mysql_password = os.environ.get("SYAA_MYSQL_PASSWORD", "")
+        mysql_host = os.environ.get("SYAA_MYSQL_HOST", "localhost")
+        mysql_port = int(os.environ.get("SYAA_MYSQL_PORT", "3306"))
+        mysql_database = os.environ.get("SYAA_MYSQL_DATABASE", "h_db")
+        if not mysql_password:
+            self._log("[MySQL迁移] 未设置环境变量 SYAA_MYSQL_PASSWORD，请先设置后再迁移")
+            self._log("[MySQL迁移] 需要的环境变量：SYAA_MYSQL_USER, SYAA_MYSQL_PASSWORD, SYAA_MYSQL_HOST, SYAA_MYSQL_PORT, SYAA_MYSQL_DATABASE")
+            return
         try:
             mysql_con = pymysql.connect(
-                user="root",
-                password="989796",
-                host="localhost",
-                port=3306,
-                database="h_db",
+                user=mysql_user,
+                password=mysql_password,
+                host=mysql_host,
+                port=mysql_port,
+                database=mysql_database,
             )
         except Exception as e:
             self._log("[MySQL迁移] 连接 MySQL 失败：{}".format(e))
