@@ -1,1 +1,38 @@
-.idea
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 数据库（含用户数据，不应提交）
+*.db
+*.db-journal
+*.db-wal
+
+# 运行时配置（含本地路径）
+gui_config.json
+
+# 输出目录（爬虫产物，体积巨大）
+output/
+src/url/output/
+
+# 可执行文件
+*.exe
+
+# WorkBuddy
+.workbuddy/
+
+# 日志
+*.log
+
+# 临时文件
+overview.md
+test_performer.py
+test_performer_result.txt
+*.spec

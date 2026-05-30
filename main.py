@@ -1,2 +1,5 @@
+from src.url.gui_app import SyaApp
+
 if __name__ == "__main__":
-    print("hai hai hai")
+    app = SyaApp()
+    app.run()
