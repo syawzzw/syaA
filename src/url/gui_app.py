@@ -222,6 +222,7 @@ def _init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_av_local_path ON av(local_path)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_av_grade ON av(grade)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_av_mosaic ON av(mosaic)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_av_magnet_extra ON av(magnet_extra)")
     # 为旧数据库添加新字段（已存在则跳过）
     try:
         cur.execute("ALTER TABLE av ADD COLUMN created_at TEXT")
@@ -245,6 +246,24 @@ def get_db_conn(timeout=30):
     con = sqlite3.connect(DB_PATH, timeout=timeout, check_same_thread=False)
     con.row_factory = None  # 使用默认 tuple
     return con
+
+
+import contextlib
+
+@contextlib.contextmanager
+def db_conn(timeout=30):
+    """数据库连接上下文管理器，自动关闭连接。
+    用法：
+        with db_conn() as con:
+            cur = con.cursor()
+            cur.execute(...)
+            con.commit()
+    """
+    con = get_db_conn(timeout=timeout)
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def _append_auto_fields(sql, val, action=None):
@@ -349,26 +368,25 @@ def _clean_performer(performer_raw):
     """清理 performer 字段中的 HTML 残留"""
     if not performer_raw:
         return ""
-    return re.sub(r'&nbsp;|<[^>]+>', '', performer_raw).strip()
+    # 复用类方法中的清洗逻辑
+    return SyaApp._clean_html_value(performer_raw)
 
 
 def judge_performer(performer):
-    """判断演员是否在黑名单（精确匹配，不拆分多演员）"""
+    """判断演员是否在黑名单（精确匹配，不拆分多演员）。
+    低频场景使用（单次查询）；磁力生成等高频场景请用 SyaApp 实例的 _is_black 方法。
+    """
     con = get_db_conn()
     cur = con.cursor()
     clean = _clean_performer(performer)
-    # 先用清理后的名字匹配
-    cur.execute("SELECT * FROM black_table WHERE name = ?", (clean,))
-    record = cur.fetchone()
-    if record is not None:
+    cur.execute("SELECT 1 FROM black_table WHERE name = ?", (clean,))
+    if cur.fetchone() is not None:
         cur.close()
         con.close()
         return True
-    # 再用原始名字匹配（黑名单可能存了含 HTML 残留的脏数据）
     if performer and performer.strip() != clean:
-        cur.execute("SELECT * FROM black_table WHERE name = ?", (performer.strip(),))
-        record = cur.fetchone()
-        if record is not None:
+        cur.execute("SELECT 1 FROM black_table WHERE name = ?", (performer.strip(),))
+        if cur.fetchone() is not None:
             cur.close()
             con.close()
             return True
@@ -378,20 +396,20 @@ def judge_performer(performer):
 
 
 def judge_performer_is_good(performer):
-    """判断演员是否在关注名单（精确匹配，不拆分多演员）"""
+    """判断演员是否在关注名单（精确匹配，不拆分多演员）。
+    低频场景使用（单次查询）；磁力生成等高频场景请用 SyaApp 实例的 _is_good 方法。
+    """
     con = get_db_conn()
     cur = con.cursor()
     clean = _clean_performer(performer)
-    cur.execute("SELECT * FROM good_performer WHERE name = ?", (clean,))
-    record = cur.fetchone()
-    if record is not None:
+    cur.execute("SELECT 1 FROM good_performer WHERE name = ?", (clean,))
+    if cur.fetchone() is not None:
         cur.close()
         con.close()
         return True
     if performer and performer.strip() != clean:
-        cur.execute("SELECT * FROM good_performer WHERE name = ?", (performer.strip(),))
-        record = cur.fetchone()
-        if record is not None:
+        cur.execute("SELECT 1 FROM good_performer WHERE name = ?", (performer.strip(),))
+        if cur.fetchone() is not None:
             cur.close()
             con.close()
             return True
@@ -400,15 +418,103 @@ def judge_performer_is_good(performer):
     return False
 
 
-def judge_current_film_is_exist(numbers_name):
-    """判断影片是否已存在"""
+def judge_current_film_is_exist(designation):
+    """按 designation（番号）判断影片是否已存在，返回已有记录 (numbers_name, magnet, magnet_extra) 或 None。
+    同一 designation 不管有码/无码都视为同一条影片，防止重复入库。
+    """
     con = get_db_conn()
     cur = con.cursor()
-    cur.execute("SELECT 1 FROM av WHERE numbers_name = ?", (numbers_name,))
+    cur.execute("SELECT numbers_name, magnet, magnet_extra FROM av WHERE designation = ?", (designation,))
     record = cur.fetchone()
     cur.close()
     con.close()
-    return record is not None
+    return record
+
+
+def is_western_designation(designation):
+    """判断番号是否为欧美片。返回 True 表示应跳过，False 表示保留。
+    
+    识别逻辑（严格避免误判日文片）：
+    1. 日文番号格式 XX-NNN（如 ABP-171, MIAA-006）→ 绝不是欧美
+    2. 小写字母+点分隔+日期（如 deeper.21.12.30）→ 欧美
+    3. 小写字母4+开头+点（如 analonly.xxx, bangbus.xxx）→ 欧美
+    4. 纯数字5位+番号 → 欧美
+    5. 已知欧美厂牌前缀 → 欧美
+    6. 英文句子标题（3+大写开头单词连排，无中日文字符）→ 欧美
+    7. 欧美题材关键词（stepmom/daddy4k等，仅对非日文格式标题）→ 欧美
+    """
+    if not designation:
+        return False
+    des = designation.strip()
+    des_lower = des.lower()
+
+    # 1. 日文番号格式：2-6个大写字母 + 连字符 + 2-6位数字
+    #    如 ABP-171, MIAA-006, SSIS-062, FC2-PPV-1234567
+    #    这是铁证，匹配此格式的一律不是欧美
+    if re.match(r'^[A-Z]{2,6}-\d{2,6}', des):
+        return False
+    if re.match(r'^FC2', des, re.IGNORECASE):
+        return False
+
+    # 2. 小写字母+点分隔+日期格式：brand.YY.MM.DD.name
+    if re.match(r'^[a-z]{3,}\.\d{2}\.\d{2}', des_lower):
+        return True
+
+    # 3. 小写字母4+开头+点（欧美厂牌.系列格式）
+    #    至少4个字母避免匹配到 b.xxx 这种短前缀
+    if re.match(r'^[a-z]{4,}\.', des_lower):
+        return True
+
+    # 4. 纯数字番号5位以上
+    if re.match(r'^\d{5,}$', des):
+        return True
+
+    # 5. 已知欧美厂牌前缀（精确匹配，避免误判日文番号）
+    western_brands = [
+        # 大厂
+        'brazzers', 'bangbros', 'realitykings', 'naughtyamerica', 'mofos',
+        'deeper', 'vixen', 'tushy', 'blacked', 'blackedraw', 'tushyraw',
+        'evilangel', 'wicked', 'sweetheart', 'girlsway', 'adulttime',
+        # 系列/子品牌
+        'bangbrosclips', 'bangbus', 'bbcpie', 'babes',
+        'allanal', 'analvids', 'analmom', 'analonly',
+        'bigtitcreampie', 'bananafever', 'archangel',
+        'daddy4k', 'cum4k', 'tiny4k', 'holed', 'exotic4k',
+        'puremature', 'pornpros', 'passion-hd',
+        'shoplyfter', 'shoplyft', 'mylf', 'pervmom', 'pervcity',
+        'sislovesme', 'brolovesme', 'daughterswap', 'momswap', 'dadcrush',
+        'sexart', 'joymii', 'thewhiteboxxx', 'porndoe', 'letsdoeit',
+        'fakehub', 'fakehostel', 'propertysex', 'publicsex',
+        'clubseventeen', 'julesjordan', 'teamskeet',
+        'helplessteens', 'hussie', 'hussiemit', 'aziani',
+        'castingcouch-x', 'backroomcastingcouch', 'netgirl', 'netvideo',
+        # 品牌-前缀匹配（如 blacked-xxx, vixen-xxx）
+        'blacked-', 'blackedraw-', 'tushy-', 'tushyraw-', 'vixen-',
+        'deeper-', 'bangbros-', 'bangbus-',
+    ]
+    for brand in western_brands:
+        if des_lower.startswith(brand):
+            return True
+
+    # 6. 英文句子标题：3+个首字母大写单词连排，无中日文字符
+    #    如 "Ava Nicks - Mommy Is Such A Whore"
+    if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+){2,}', des):
+        if not re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', des):
+            return True
+
+    # 7. 欧美题材关键词（保守选择，仅日文标题中极不可能出现的词）
+    #    如 stepmom, stepdad, mommy, daddy4k, milf
+    #    注意：anal, creampie, pov 等词在日文标题中也可能出现，不用
+    western_indicators = [
+        'stepmom', 'stepdad', 'step-mom', 'step-dad',
+        'step-sister', 'step-brother', 'stepsister', 'stepbrother',
+        'mommy', 'milf', 'daddy4k',
+    ]
+    for w in western_indicators:
+        if w in des_lower:
+            return True
+
+    return False
 
 
 # ============================================================
@@ -748,6 +854,15 @@ class SyaApp:
         self._crawl_total = 0  # 总帖子数
         self._crawl_processed_lock = threading.Lock()
 
+        # 黑名单/白名单缓存（避免每次查询都开DB连接）
+        self._black_set = None
+        self._good_set = None
+        self._list_cache_time = 0  # 上次缓存时间
+        self._list_cache_ttl = 30  # 缓存30秒
+
+        # 115扫描计数器
+        self._check_115_count = 0
+
         self._build_ui()
         self._poll_log()
 
@@ -827,6 +942,44 @@ class SyaApp:
     # --------------------------------------------------------
     #  UI 构建
     # --------------------------------------------------------
+    # --------------------------------------------------------
+    #  黑名单/白名单缓存（性能优化）
+    # --------------------------------------------------------
+    def _refresh_list_cache(self):
+        """刷新黑名单/白名单缓存（带 TTL）"""
+        now = time.time()
+        if self._black_set is not None and (now - self._list_cache_time) < self._list_cache_ttl:
+            return  # 缓存未过期
+        con = get_db_conn()
+        cur = con.cursor()
+        cur.execute("SELECT name FROM black_table")
+        self._black_set = {row[0] for row in cur.fetchall()}
+        cur.execute("SELECT name FROM good_performer")
+        self._good_set = {row[0] for row in cur.fetchall()}
+        cur.close()
+        con.close()
+        self._list_cache_time = now
+
+    def _is_black(self, performer):
+        """判断演员是否在黑名单（使用缓存，O(1)查找，适合批量场景）"""
+        self._refresh_list_cache()
+        clean = _clean_performer(performer)
+        if clean in self._black_set:
+            return True
+        if performer and performer.strip() != clean and performer.strip() in self._black_set:
+            return True
+        return False
+
+    def _is_good(self, performer):
+        """判断演员是否在关注名单（使用缓存，O(1)查找，适合批量场景）"""
+        self._refresh_list_cache()
+        clean = _clean_performer(performer)
+        if clean in self._good_set:
+            return True
+        if performer and performer.strip() != clean and performer.strip() in self._good_set:
+            return True
+        return False
+
     def _build_ui(self):
         # 顶部 Notebook
         self.nb = ttk.Notebook(self.root)
@@ -942,6 +1095,7 @@ class SyaApp:
             self._sb_stats.set("")
 
     # ============ Tab 1: 论坛爬取 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_crawl_tab 及其 worker 方法提取到 crawl_tab.py
     def _build_crawl_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="论坛爬取")
@@ -1165,6 +1319,70 @@ class SyaApp:
             sum(self.crawl_stats.values()), total, sum(self.crawl_stats.values())))
         self.root.after(0, self._crawl_done)
 
+    # 爬取用常量：已知的字段名列表（用于判断值的终止位置）
+    _CRAWL_KNOWN_FIELDS = ["影片名称", "出演女优", "影片容量", "是否有码", "种子期限", "下载工具"]
+
+    @staticmethod
+    def _clean_html_value(val):
+        """统一清洗：去HTML标签、HTML实体、残缺标签、多余空白"""
+        if not val:
+            return ""
+        # 1. 去完整HTML标签 <...>
+        val = re.sub(r"<[^>]*>", "", val)
+        # 2. 去残缺HTML闭合标签（如 </td></tr></ 这种没有闭合 > 的）
+        val = re.sub(r"</[a-zA-Z][^>]*$", "", val)
+        # 3. 去残缺HTML开头标签（如 tyle="font-size:14px"> 这种被截断的属性）
+        val = re.sub(r'^[a-zA-Z]+=["\'][^"\']*["\']>', "", val)
+        # 4. 解码常见HTML实体
+        val = val.replace("&nbsp;", " ")
+        val = val.replace("&amp;", "&")
+        val = val.replace("&lt;", "<")
+        val = val.replace("&gt;", ">")
+        val = val.replace("&quot;", '"')
+        val = val.replace("&#39;", "'")
+        # 5. 去HTML实体数字形式 &#NNN;
+        val = re.sub(r"&#\d+;", "", val)
+        # 6. 去残余的 </ 或 <
+        val = re.sub(r"</?$", "", val)
+        # 7. 合并多余空白
+        val = re.sub(r"\s+", " ", val).strip()
+        # 8. 去首尾引号
+        val = val.strip('"').strip()
+        return val
+
+    @staticmethod
+    def _extract_field(html, field_name, default="unknown"):
+        """从HTML中提取【字段名】：值，兼容纯文本和带HTML标签的格式"""
+        # 策略1: 从正文 <font> 标签区域提取（每个字段独占一行，最可靠）
+        # 匹配 <font...>【字段名】：值</font>  其中值内部可以包含【】
+        pat_font = r"<font[^>]*>\s*【{}】[：:]\s*(.*?)\s*</font>".format(field_name)
+        ret = re.findall(pat_font, html, re.DOTALL)
+        if ret:
+            val = SyaApp._clean_html_value(ret[0])
+            if val:
+                return val
+
+        # 策略2: 从 meta description 提取（字段紧凑排列，用下一个已知字段名作为终止）
+        other_fields = [f for f in SyaApp._CRAWL_KNOWN_FIELDS if f != field_name]
+        stop_pattern = "|".join(re.escape("【" + f + "】") for f in other_fields)
+        if stop_pattern:
+            pat_meta = r"【{}】[：:]\s*((?:(?!{}).)*)".format(field_name, stop_pattern)
+            ret = re.findall(pat_meta, html)
+            if ret:
+                val = SyaApp._clean_html_value(ret[0])
+                if val:
+                    return val
+
+        # 策略3: 简单兜底
+        pat_simple = r"【{}】[：:]\s*([^<\"]+)".format(field_name)
+        ret = re.findall(pat_simple, html)
+        if ret:
+            val = SyaApp._clean_html_value(ret[0])
+            if val:
+                return val
+
+        return default
+
     def _crawl_range(self, begin, end, cookie):
         """爬取一个范围的帖子"""
         thread_id = threading.current_thread().name
@@ -1288,55 +1506,33 @@ class SyaApp:
             except (IndexError, ValueError):
                 pass
 
-            # 通用字段提取函数：从 HTML 中提取【字段名】：值
-            # 已知的字段名列表（用于判断值的终止位置）
-            _known_fields = ["影片名称", "出演女优", "影片容量", "是否有码", "种子期限", "下载工具"]
-
-            def extract_field(field_name, default="unknown"):
-                """从HTML中提取【字段名】：值，兼容纯文本和带HTML标签的格式"""
-                # 策略1: 从正文 <font> 标签区域提取（每个字段独占一行，最可靠）
-                # 匹配 <font...>【字段名】：值</font>  其中值内部可以包含【】
-                pat_font = r"<font[^>]*>\s*【{}】[：:]\s*(.*?)\s*</font>".format(field_name)
-                ret = re.findall(pat_font, html, re.DOTALL)
-                if ret:
-                    val = ret[0].strip()
-                    val = re.sub(r"<[^>]+>", "", val).strip()
-                    if val:
-                        return val
-
-                # 策略2: 从 meta description 提取（字段紧凑排列，用下一个已知字段名作为终止）
-                other_fields = [f for f in _known_fields if f != field_name]
-                stop_pattern = "|".join(re.escape("【" + f + "】") for f in other_fields)
-                if stop_pattern:
-                    pat_meta = r"【{}】[：:]\s*((?:(?!{}).)*)".format(field_name, stop_pattern)
-                    ret = re.findall(pat_meta, html)
-                    if ret:
-                        val = ret[0].strip()
-                        val = re.sub(r"<[^>]+>", "", val).strip()
-                        val = val.rstrip('"').strip()
-                        if val:
-                            return val
-
-                # 策略3: 简单兜底
-                pat_simple = r"【{}】[：:]\s*([^<\"]+)".format(field_name)
-                ret = re.findall(pat_simple, html)
-                if ret:
-                    val = ret[0].strip()
-                    val = re.sub(r"<[^>]+>", "", val).strip()
-                    val = val.rstrip('"').strip()
-                    if val:
-                        return val
-
-                return default
-
-            # 6. 演员
-            performer = extract_field("出演女优", "unknown")
+            # 6. 演员（额外清洗：去占位符、统一分隔符、去残留字段前缀和尾部标点）
+            performer = self._extract_field(html, "出演女优", "unknown")
+            if performer and performer != "unknown":
+                # 去占位符
+                if performer.strip().lower() in ("zzz", "zzz ", " zzz", "未知", "无"):
+                    performer = "unknown"
+                else:
+                    # 去策略2残留下来的【字段名】：前缀
+                    performer = re.sub(r"^【[^】]*】[：:]\s*", "", performer)
+                    # 统一分隔符：顿号/全角空格/制表符 → 半角空格
+                    performer = re.sub(r"[、，,\t　]", " ", performer)
+                    # 去尾部残留标点
+                    performer = performer.rstrip(".;。、,，/\\")
+                    # 合并多余空格
+                    performer = re.sub(r"\s+", " ", performer).strip()
 
             # 7. 大小
-            size = extract_field("影片容量", "unknown")
+            size = self._extract_field(html, "影片容量", "unknown")
 
-            # 8. 有码
-            mosaic = extract_field("是否有码", "unknown")
+            # 8. 有码（统一为"有码"/"无码"）
+            mosaic = self._extract_field(html, "是否有码", "unknown")
+            if mosaic and mosaic != "unknown":
+                mosaic_lower = mosaic.lower()
+                if any(kw in mosaic_lower for kw in ("有码", "马赛克", "モザイク", "mosaic")):
+                    mosaic = "有码"
+                elif any(kw in mosaic_lower for kw in ("无码", "無码", "無修正", "无修正", " uncensored", "破解")):
+                    mosaic = "无码"
 
             # 9. 查看 / 回复
             view, reply = 0, 0
@@ -1348,7 +1544,7 @@ class SyaApp:
                         reply = int(ret[1][1:-1])
 
             # 10. 影片名称
-            film_name = extract_field("影片名称", "unknown")
+            film_name = self._extract_field(html, "影片名称", "unknown")
 
             # 提取到的信息汇总日志
             self._log("[{}] [INFO] 番号={} | 类型={} | 演员={} | 影片={} | 大小={} | 码={} | 热度={} | 查看/回复={}/{} | 磁力={}".format(
@@ -1369,9 +1565,25 @@ class SyaApp:
             except Exception as e:
                 self._log("[磁力] 写入磁力文件失败 | {} | 错误: {}".format(next_url, e))
 
-            # 12. 判断已存在
-            if judge_current_film_is_exist(fanhao):
-                self._log("[已存在] [SKIP] 跳过入库 | {} | 番号: {} | 演员: {} | 影片: {}".format(next_url, fanhao, performer, film_name[:30]))
+            # 11.5 跳过欧美片（根据番号格式自动识别）
+            if is_western_designation(designation):
+                self._log("[欧美] [SKIP] 跳过欧美片 | {} | 番号: {}".format(next_url, designation))
+                self.crawl_stats.setdefault("western_skip", 0)
+                self.crawl_stats["western_skip"] += 1
+                continue
+
+            # 12. 判断已存在（按 designation 查重，同番号只保留一条）
+            existing = judge_current_film_is_exist(designation)
+            if existing:
+                existing_key, existing_magnet, existing_extra = existing
+                # 磁力不同时，合并到 magnet_extra 字段
+                if mag[0] != existing_magnet:
+                    extra_entry = "[{}] {}|||{}".format(mosaic, fanhao, mag[0])
+                    new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
+                    link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
+                    self._log("[已存在] [合并磁力] 额外磁力已保存到 magnet_extra | {} | 番号: {} | 码制: {}".format(next_url, designation, mosaic))
+                else:
+                    self._log("[已存在] [SKIP] 磁力相同，跳过 | {} | 番号: {}".format(next_url, designation))
                 self.crawl_stats["exist"] += 1
                 continue
 
@@ -1411,7 +1623,19 @@ class SyaApp:
                     self._log("  +-------------------------------------------------------------------------")
                     self.crawl_stats["new"] += 1
             except sqlite3.IntegrityError:
-                self._log("[DUP] 数据库已有 | {} | 番号: {}".format(next_url, fanhao))
+                # 主键冲突（多线程竞态），尝试合并磁力
+                existing = judge_current_film_is_exist(designation)
+                if existing:
+                    existing_key, existing_magnet, existing_extra = existing
+                    if mag[0] != existing_magnet:
+                        extra_entry = "[{}] {}|||{}".format(mosaic, fanhao, mag[0])
+                        new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
+                        link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
+                        self._log("[DUP-MERGE] 合并磁力 | {} | 番号: {}".format(next_url, designation))
+                    else:
+                        self._log("[DUP] 磁力相同，跳过 | {} | 番号: {}".format(next_url, designation))
+                else:
+                    self._log("[DUP] 数据库已有 | {} | 番号: {}".format(next_url, fanhao))
                 self.crawl_stats["exist"] += 1
             except UnicodeEncodeError:
                 self._log("[编码异常] [FAIL] | {} | 标题: {}".format(next_url, title[:40]))
@@ -1512,6 +1736,7 @@ class SyaApp:
         self.crawl_result.config(state=tk.DISABLED)
 
     # ============ Tab 2: 播放视频 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_video_tab 及其相关方法提取到 video_tab.py
     def _build_video_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="播放视频")
@@ -1593,6 +1818,21 @@ class SyaApp:
         # 文字信息区
         self.vid_info = scrolledtext.ScrolledText(right, font=("Consolas", 10), height=12)
         self.vid_info.pack(fill=tk.BOTH, expand=True)
+
+    def _load_video_from_record(self, rec):
+        """从数据库查询结果 rec（tuple）加载到 self.cur_video，消除重复赋值代码。
+        rec 应为按 AV_COLUMNS 顺序的查询结果。
+        """
+        self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
+        self.cur_video["path"] = rec[IDX_LOCAL_PATH] or ""
+        self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
+        self.cur_video["performer"] = rec[IDX_PERFORMER]
+        self.cur_video["mosaic"] = rec[IDX_MOSAIC]
+        self.cur_video["video_name"] = rec[IDX_FILM_NAME]
+        self.cur_video["grade"] = rec[IDX_GRADE] if rec[IDX_GRADE] is not None else ""
+        self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
+        self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
+        self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
 
     def _update_video_info(self, extra=""):
         """刷新右侧视频信息"""
@@ -1771,16 +2011,7 @@ class SyaApp:
             if rec is None:
                 self._update_video_info("没有符合条件的视频")
                 return
-            self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
-            self.cur_video["path"] = rec[IDX_LOCAL_PATH]
-            self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
-            self.cur_video["performer"] = rec[IDX_PERFORMER]
-            self.cur_video["mosaic"] = rec[IDX_MOSAIC]
-            self.cur_video["video_name"] = rec[IDX_FILM_NAME]
-            self.cur_video["grade"] = rec[IDX_GRADE] if len(rec) > IDX_GRADE else ""
-            self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
-            self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
-            self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
+            self._load_video_from_record(rec)
             self._update_video_info()
         except Exception as e:
             self._update_video_info("数据库错误：{}".format(e))
@@ -1827,16 +2058,7 @@ class SyaApp:
         # 如果只有一条结果，直接选中
         if len(results) == 1:
             rec = results[0]
-            self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
-            self.cur_video["path"] = rec[IDX_LOCAL_PATH] or ""
-            self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
-            self.cur_video["performer"] = rec[IDX_PERFORMER]
-            self.cur_video["mosaic"] = rec[IDX_MOSAIC]
-            self.cur_video["video_name"] = rec[IDX_FILM_NAME]
-            self.cur_video["grade"] = rec[IDX_GRADE] if rec[IDX_GRADE] is not None else ""
-            self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
-            self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
-            self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
+            self._load_video_from_record(rec)
             self._update_video_info()
             return
 
@@ -1879,16 +2101,7 @@ class SyaApp:
         result_index = line_num - 2
         if 0 <= result_index < len(self._search_results):
             rec = self._search_results[result_index]
-            self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
-            self.cur_video["path"] = rec[IDX_LOCAL_PATH] or ""
-            self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
-            self.cur_video["performer"] = rec[IDX_PERFORMER]
-            self.cur_video["mosaic"] = rec[IDX_MOSAIC]
-            self.cur_video["video_name"] = rec[IDX_FILM_NAME]
-            self.cur_video["grade"] = rec[IDX_GRADE] if rec[IDX_GRADE] is not None else ""
-            self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
-            self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
-            self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
+            self._load_video_from_record(rec)
             self.vid_info.unbind("<Double-Button-1>")
             self._update_video_info()
 
@@ -1952,16 +2165,7 @@ class SyaApp:
                 cur.close()
                 con.close()
                 if rec:
-                    self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
-                    self.cur_video["path"] = rec[IDX_LOCAL_PATH] or ""
-                    self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
-                    self.cur_video["performer"] = rec[IDX_PERFORMER]
-                    self.cur_video["mosaic"] = rec[IDX_MOSAIC]
-                    self.cur_video["video_name"] = rec[IDX_FILM_NAME]
-                    self.cur_video["grade"] = rec[IDX_GRADE] if rec[IDX_GRADE] is not None else ""
-                    self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
-                    self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
-                    self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
+                    self._load_video_from_record(rec)
                     self._update_video_info("已撤销：{}".format(action))
 
             self.undo_status.set("")
@@ -2021,16 +2225,7 @@ class SyaApp:
             if rec is None:
                 self._update_video_info("没有>={}分的视频".format(grade))
                 return
-            self.cur_video["key"] = rec[IDX_NUMBERS_NAME]
-            self.cur_video["path"] = rec[IDX_LOCAL_PATH]
-            self.cur_video["fanhao"] = rec[IDX_DESIGNATION]
-            self.cur_video["performer"] = rec[IDX_PERFORMER]
-            self.cur_video["mosaic"] = rec[IDX_MOSAIC]
-            self.cur_video["video_name"] = rec[IDX_FILM_NAME]
-            self.cur_video["grade"] = rec[IDX_GRADE] if len(rec) > IDX_GRADE else ""
-            self.cur_video["created_at"] = rec[IDX_CREATED_AT] if len(rec) > IDX_CREATED_AT and rec[IDX_CREATED_AT] else ""
-            self.cur_video["updated_at"] = rec[IDX_UPDATED_AT] if len(rec) > IDX_UPDATED_AT and rec[IDX_UPDATED_AT] else ""
-            self.cur_video["last_action"] = rec[IDX_LAST_ACTION] if len(rec) > IDX_LAST_ACTION and rec[IDX_LAST_ACTION] else ""
+            self._load_video_from_record(rec)
             self._update_video_info()
         except Exception as e:
             self._update_video_info("数据库错误：{}".format(e))
@@ -2109,6 +2304,7 @@ class SyaApp:
                 self._update_video_info("已从关注名单移除：{}".format(clean_name))
 
     # ============ Tab 3: 磁力生成 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_magnet_tab 及其相关方法提取到 magnet_tab.py
     def _build_magnet_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="磁力生成")
@@ -2254,12 +2450,12 @@ class SyaApp:
                         pass
 
                 # 黑名单过滤
-                if judge_performer(performer):
+                if self._is_black(performer):
                     skipped_blacklist += 1
                     continue
 
                 # 白名单过滤
-                if white_only and not judge_performer_is_good(performer):
+                if white_only and not self._is_good(performer):
                     skipped_white += 1
                     continue
 
@@ -2304,23 +2500,29 @@ class SyaApp:
                     self._log("[磁力] 已复制 {} 条磁力链接到剪贴板".format(len(lines)))
 
     def _gen_magnet_whitelist(self):
-        """遍历数据库所有记录，仅返回白名单演员的磁力链接"""
+        """遍历数据库所有记录，仅返回白名单演员的磁力链接。
+        优化：先在 SQL 层排除 performer 精确匹配黑名单的记录，再 Python 层精细过滤。
+        """
         show_info = self.magnet_show_info.get()
 
         try:
-            con = get_db_conn()
-            cur = con.cursor()
+            # 强制刷新缓存
+            self._refresh_list_cache()
+            self._list_cache_time = 0  # 强制下次也刷新
 
-            # 查询所有有磁力链接且未下载/未评分的记录，排除-UC
-            sql = (
-                "SELECT numbers_name, performer, magnet, size, hot_num, film_name, mosaic "
-                "FROM av WHERE local_path IS NULL AND grade IS NULL AND magnet IS NOT NULL "
-                "AND numbers_name NOT LIKE '%%-UC'"
-            )
-            cur.execute(sql)
-            records = cur.fetchall()
-            cur.close()
-            con.close()
+            with db_conn() as con:
+                cur = con.cursor()
+
+                # SQL 层：排除 performer 精确在黑名单的记录 + 排除-UC
+                sql = (
+                    "SELECT numbers_name, performer, magnet, size, hot_num, film_name, mosaic "
+                    "FROM av WHERE local_path IS NULL AND grade IS NULL AND magnet IS NOT NULL "
+                    "AND numbers_name NOT LIKE '%%-UC' "
+                    "AND performer NOT IN (SELECT name FROM black_table)"
+                )
+                cur.execute(sql)
+                records = cur.fetchall()
+                cur.close()
 
             self.magnet_text.delete(1.0, tk.END)
             magnets_only = []
@@ -2330,13 +2532,13 @@ class SyaApp:
             for rec in records:
                 fanhao, performer, magnet, size, hot_num, film_name, mosaic = rec
 
-                # 黑名单过滤
-                if judge_performer(performer):
+                # Python 层精细黑名单过滤（处理多演员字段）
+                if self._is_black(performer):
                     skipped_blacklist += 1
                     continue
 
-                # 非白名单过滤
-                if not judge_performer_is_good(performer):
+                # 白名单过滤
+                if not self._is_good(performer):
                     skipped_not_white += 1
                     continue
 
@@ -2382,6 +2584,7 @@ class SyaApp:
                 self._log("[磁力] 保存失败：{}".format(e))
 
     # ============ Tab 4: 数据库管理 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_db_tab 及其相关方法提取到 db_tab.py
     def _build_db_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="数据库管理")
@@ -2471,8 +2674,6 @@ class SyaApp:
                         rec = cur.fetchone()
                     cur.close()
                     # 每100个文件提交一次，平衡性能和锁持有时间
-                    if not hasattr(self, '_check_115_count'):
-                        self._check_115_count = 0
                     self._check_115_count += 1
                     if self._check_115_count % 100 == 0:
                         con.commit()
@@ -2512,22 +2713,22 @@ class SyaApp:
 
     def _clean_db_worker(self):
         try:
-            con = get_db_conn()
-            cur = con.cursor()
-            cur.execute("SELECT {} FROM av WHERE local_path IS NOT NULL".format(AV_COLUMNS))
-            rec = cur.fetchone()
-            cleaned = 0
-            while rec is not None:
-                curr_path = rec[IDX_LOCAL_PATH]
-                curr_name = rec[IDX_NUMBERS_NAME]
-                if curr_path and not os.path.isfile(curr_path):
-                    link_db_cmd("UPDATE av SET local_path = NULL WHERE numbers_name = ?", (curr_name,), action="路径清理")
-                    link_db_cmd("UPDATE av SET exist_in_115 = NULL WHERE numbers_name = ?", (curr_name,), action="路径清理")
-                    self._log("[清理] 路径无效：{}".format(curr_path))
-                    cleaned += 1
-                rec = cur.fetchone()
-            cur.close()
-            con.close()
+            with db_conn() as con:
+                cur = con.cursor()
+                cur.execute("SELECT {} FROM av WHERE local_path IS NOT NULL".format(AV_COLUMNS))
+                records = cur.fetchall()
+                cleaned = 0
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                for rec in records:
+                    curr_path = rec[IDX_LOCAL_PATH]
+                    curr_name = rec[IDX_NUMBERS_NAME]
+                    if curr_path and not os.path.isfile(curr_path):
+                        cur.execute("UPDATE av SET local_path = NULL, exist_in_115 = NULL, updated_at = ?, last_action = ? WHERE numbers_name = ?",
+                                    (now_str, "路径清理", curr_name))
+                        self._log("[清理] 路径无效：{}".format(curr_path))
+                        cleaned += 1
+                con.commit()
+                cur.close()
             self._log("清理完成，共清理 {} 条".format(cleaned))
         except Exception as e:
             self._log("清理失败：{}".format(e))
@@ -2538,27 +2739,28 @@ class SyaApp:
 
     def _only_one_worker(self):
         try:
-            con = get_db_conn()
-            cur = con.cursor()
-            cur.execute("SELECT {} FROM av WHERE mosaic = ?".format(AV_COLUMNS), ("无码",))
-            rec = cur.fetchone()
-            removed = 0
-            while rec is not None:
-                fanhao = rec[IDX_DESIGNATION]
-                curr_path = rec[IDX_LOCAL_PATH]
-                curr_name = rec[IDX_NUMBERS_NAME]
-                if curr_path is not None:
-                    cur2 = con.cursor()
-                    cur2.execute("SELECT count(*) FROM av WHERE designation = ?", (fanhao,))
-                    nums = cur2.fetchone()[0]
-                    cur2.close()
-                    if nums > 1:
-                        link_db_cmd("UPDATE av SET local_path = NULL WHERE numbers_name = ?", (curr_name,), action="去重清理")
-                        self._log("[去重] 移除无码版本路径：{}".format(curr_path))
-                        removed += 1
-                rec = cur.fetchone()
-            cur.close()
-            con.close()
+            with db_conn() as con:
+                cur = con.cursor()
+                cur.execute("SELECT {} FROM av WHERE mosaic = ?".format(AV_COLUMNS), ("无码",))
+                records = cur.fetchall()
+                removed = 0
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                for rec in records:
+                    fanhao = rec[IDX_DESIGNATION]
+                    curr_path = rec[IDX_LOCAL_PATH]
+                    curr_name = rec[IDX_NUMBERS_NAME]
+                    if curr_path is not None:
+                        cur2 = con.cursor()
+                        cur2.execute("SELECT count(*) FROM av WHERE designation = ?", (fanhao,))
+                        nums = cur2.fetchone()[0]
+                        cur2.close()
+                        if nums > 1:
+                            cur.execute("UPDATE av SET local_path = NULL, updated_at = ?, last_action = ? WHERE numbers_name = ?",
+                                        (now_str, "去重清理", curr_name))
+                            self._log("[去重] 移除无码版本路径：{}".format(curr_path))
+                            removed += 1
+                con.commit()
+                cur.close()
             self._log("去重完成，移除 {} 条".format(removed))
         except Exception as e:
             self._log("去重失败：{}".format(e))
@@ -2581,18 +2783,17 @@ class SyaApp:
                 cur = con.cursor()
                 cur.execute("SELECT 1 FROM av WHERE local_path = ?", (cur_file_path,))
                 rec = cur.fetchone()
-                cur.close()
-                con.close()
                 if rec is not None:
+                    cur.close()
+                    con.close()
                     continue
                 self._log("[外部视频] 添加：{}".format(cur_file_path))
-                con = get_db_conn()
-                cur2 = con.cursor()
-                cur2.execute("SELECT count(*) FROM av WHERE zzz IS NOT NULL")
-                numbers = cur2.fetchone()[0]
-                cur2.close()
+                # 原子获取 max(zzz)+1 避免竞态，INSERT OR IGNORE 防主键冲突
+                cur.execute("SELECT COALESCE(MAX(zzz), 0) + 1 FROM av")
+                next_zzz = cur.fetchone()[0]
+                numbers_name = "zzz-{}".format(next_zzz)
+                cur.close()
                 con.close()
-                numbers_name = "zzz-{}".format(numbers + 1)
                 try:
                     os.rename(cur_file_path, path + numbers_name + " " + file)
                 except Exception:
@@ -2600,9 +2801,9 @@ class SyaApp:
                 new_path = path + numbers_name + " " + file
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
                 link_db_cmd(
-                    "INSERT INTO av (numbers_name, name, performer, mosaic, designation, film_name, local_path, zzz, created_at, updated_at) "
+                    "INSERT OR IGNORE INTO av (numbers_name, name, performer, mosaic, designation, film_name, local_path, zzz, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [numbers_name, file, "zzz", "有码", numbers_name, numbers_name, new_path, numbers + 1, now_str, now_str],
+                    [numbers_name, file, "zzz", "有码", numbers_name, numbers_name, new_path, next_zzz, now_str, now_str],
                 )
                 added += 1
             self._log("外部视频入库完成，新增 {} 条".format(added))
@@ -3042,6 +3243,7 @@ class SyaApp:
             self._log("[MySQL迁移] 迁移失败：{}".format(e))
 
     # ============ Tab 5: 文件整理 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_file_tab 及其相关方法提取到 file_tab.py
     def _build_file_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="文件整理")
@@ -4256,6 +4458,7 @@ a:hover {{ text-decoration: underline; }}
                     f.write("{}/{}\n".format(grade_dir, filename))
 
     # ============ Tab 6: 小说爬取 ============
+    # [ARCH] 如果将来拆分模块，可将 _build_book_tab 及其相关方法提取到 book_tab.py
     def _build_book_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="小说爬取")
