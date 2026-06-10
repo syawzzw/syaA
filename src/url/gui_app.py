@@ -1137,7 +1137,7 @@ class SyaApp:
         ttk.Button(row2, text="选择Cookie文件...", command=self._browse_cookie).pack(side=tk.LEFT, padx=4)
 
         row3 = ttk.Frame(tab)
-        row3.pack(fill=tk.X, padx=10, pady=6)
+        row3.pack(fill=tk.X, padx=10, pady=(6, 2))
 
         self.btn_crawl_start = ttk.Button(row3, text="开始爬取", command=self._start_crawl)
         self.btn_crawl_start.pack(side=tk.LEFT, padx=4)
@@ -1154,13 +1154,16 @@ class SyaApp:
         self.crawl_custom_pages.pack(side=tk.LEFT, padx=2)
         ttk.Button(row3, text="爬取", command=self._custom_crawl).pack(side=tk.LEFT, padx=2)
 
-        # 爬取进度条
+        # 爬取进度条（独立一行，避免被按钮挤出可视区域）
+        row3b = ttk.Frame(tab)
+        row3b.pack(fill=tk.X, padx=10, pady=(0, 6))
+
         self.crawl_status = tk.StringVar(value="就绪")
-        ttk.Label(row3, textvariable=self.crawl_status).pack(side=tk.LEFT, padx=(20, 4))
-        self.crawl_progress = ttk.Progressbar(row3, length=250, mode="determinate")
+        ttk.Label(row3b, textvariable=self.crawl_status).pack(side=tk.LEFT, padx=(0, 4))
+        self.crawl_progress = ttk.Progressbar(row3b, length=250, mode="determinate")
         self.crawl_progress.pack(side=tk.LEFT, padx=4)
         self.crawl_progress_label = tk.StringVar(value="")
-        ttk.Label(row3, textvariable=self.crawl_progress_label).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row3b, textvariable=self.crawl_progress_label).pack(side=tk.LEFT, padx=4)
 
         # 爬取结果区
         res_frame = ttk.LabelFrame(tab, text="爬取统计")
