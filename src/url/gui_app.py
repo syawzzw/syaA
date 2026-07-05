@@ -19,6 +19,8 @@ import json
 import random
 import math
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse, urlunparse
 
 
 
@@ -854,6 +856,12 @@ class SyaApp:
         self._crawl_total = 0  # 总帖子数
         self._crawl_processed_lock = threading.Lock()
 
+        # 离线爬取专用
+        self._offline_dl_lock = threading.Lock()  # 离线爬取线程安全锁
+        self._crawl_verify_post_id = None  # Cookie二次验证用帖号
+        self._last_success_time = 0  # 最近成功请求时间（60秒内跳过二次验证）
+        self._crawl_stop_reason = ""  # 爬取终止原因
+
         # 黑名单/白名单缓存（避免每次查询都开DB连接）
         self._black_set = None
         self._good_set = None
@@ -1118,6 +1126,11 @@ class SyaApp:
         self.crawl_threads.insert(0, self.config.get("crawl_threads", "10"))
         self.crawl_threads.pack(side=tk.LEFT, padx=(2, 10))
 
+        ttk.Label(row, text="离线并发页数:").pack(side=tk.LEFT)
+        self.offline_concurrent = ttk.Combobox(row, width=4, values=["1", "2", "3", "4"], state="readonly")
+        self.offline_concurrent.set(self.config.get("offline_concurrent", "1"))
+        self.offline_concurrent.pack(side=tk.LEFT, padx=(2, 10))
+
         row_url = ttk.Frame(tab)
         row_url.pack(fill=tk.X, padx=10, pady=2)
 
@@ -1153,6 +1166,24 @@ class SyaApp:
         self.crawl_custom_pages = ttk.Entry(row3, width=6)
         self.crawl_custom_pages.pack(side=tk.LEFT, padx=2)
         ttk.Button(row3, text="爬取", command=self._custom_crawl).pack(side=tk.LEFT, padx=2)
+
+        # 离线爬取按钮
+        ttk.Separator(row3, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.btn_offline_crawl = ttk.Button(row3, text="离线爬取", command=self._start_offline_crawl)
+        self.btn_offline_crawl.pack(side=tk.LEFT, padx=4)
+
+        # ── 离线爬取独立帖号（与普通爬取分开记录进度，互不干扰）──
+        row_offline_id = ttk.Frame(tab)
+        row_offline_id.pack(fill=tk.X, padx=10, pady=(6, 2))
+        ttk.Label(row_offline_id, text="离线起始帖号:").pack(side=tk.LEFT)
+        self.offline_crawl_begin = ttk.Entry(row_offline_id, width=12)
+        self.offline_crawl_begin.insert(0, self.config.get("offline_crawl_begin", "3369770"))
+        self.offline_crawl_begin.pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(row_offline_id, text="离线结束帖号:").pack(side=tk.LEFT)
+        self.offline_crawl_end = ttk.Entry(row_offline_id, width=12)
+        self.offline_crawl_end.insert(0, self.config.get("offline_crawl_end", "3380551"))
+        self.offline_crawl_end.pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(row_offline_id, text="(离线爬取使用独立帖号，不影响普通爬取的起止范围)", foreground="gray").pack(side=tk.LEFT, padx=4)
 
         # 爬取进度条（独立一行，避免被按钮挤出可视区域）
         row3b = ttk.Frame(tab)
@@ -1355,35 +1386,51 @@ class SyaApp:
 
     @staticmethod
     def _extract_field(html, field_name, default="unknown"):
-        """从HTML中提取【字段名】：值，兼容纯文本和带HTML标签的格式"""
-        # 策略1: 从正文 <font> 标签区域提取（每个字段独占一行，最可靠）
-        # 匹配 <font...>【字段名】：值</font>  其中值内部可以包含【】
-        pat_font = r"<font[^>]*>\s*【{}】[：:]\s*(.*?)\s*</font>".format(field_name)
-        ret = re.findall(pat_font, html, re.DOTALL)
-        if ret:
-            val = SyaApp._clean_html_value(ret[0])
-            if val:
-                return val
+        """从HTML中提取【字段名】：值，四策略逐级降级。"""
+        candidates = []
 
-        # 策略2: 从 meta description 提取（字段紧凑排列，用下一个已知字段名作为终止）
+        # 策略1: <font> 标签区域
+        pat_font = r"<font[^>]*>\s*【{}】[：:]\s*(.*?)\s*</font>".format(field_name)
+        for m in re.findall(pat_font, html, re.DOTALL):
+            val = SyaApp._clean_html_value(m)
+            if val:
+                candidates.append(val)
+
+        # 策略2: 正文纯文本
+        pat_body = r"【{}】[：:]\s*(.*?)(?:<br|<BR|\n|【)".format(field_name)
+        for m in re.findall(pat_body, html):
+            val = SyaApp._clean_html_value(m)
+            if val:
+                candidates.append(val)
+
+        # 策略3: meta description
         other_fields = [f for f in SyaApp._CRAWL_KNOWN_FIELDS if f != field_name]
         stop_pattern = "|".join(re.escape("【" + f + "】") for f in other_fields)
         if stop_pattern:
             pat_meta = r"【{}】[：:]\s*((?:(?!{}).)*)".format(field_name, stop_pattern)
-            ret = re.findall(pat_meta, html)
-            if ret:
-                val = SyaApp._clean_html_value(ret[0])
+            for m in re.findall(pat_meta, html):
+                val = SyaApp._clean_html_value(m)
                 if val:
-                    return val
+                    candidates.append(val)
 
-        # 策略3: 简单兜底
-        pat_simple = r"【{}】[：:]\s*([^<\"]+)".format(field_name)
-        ret = re.findall(pat_simple, html)
-        if ret:
-            val = SyaApp._clean_html_value(ret[0])
+        # 策略4: 简单兜底
+        pat_simple = r"【{}】[：:]\s*([^<\"【]+)".format(field_name)
+        for m in re.findall(pat_simple, html):
+            val = SyaApp._clean_html_value(m)
             if val:
-                return val
+                candidates.append(val)
 
+        # 选最佳值
+        for val in candidates:
+            if "【" not in val and len(val) <= 80 and "<" not in val:
+                return val
+        for val in candidates:
+            if "【" not in val and len(val) <= 100:
+                return val
+        for val in candidates:
+            if len(val) <= 100:
+                return val
+        # 所有候选都含【或超长，说明提取有问题，返回默认值
         return default
 
     def _crawl_range(self, begin, end, cookie):
@@ -1518,6 +1565,14 @@ class SyaApp:
                 else:
                     # 去策略2残留下来的【字段名】：前缀
                     performer = re.sub(r"^【[^】]*】[：:]\s*", "", performer)
+                    # 去 meta description 溢出的【字段名】标签及后续内容
+                    # 但保留以【开头的合法艺名（如【藤村兰&ネオペイ】）
+                    if not performer.startswith("【"):
+                        performer = re.sub(r"【[^】]*】.*$", "", performer).strip()
+                    # 去 HTML 属性残留（如 " />）
+                    performer = re.sub(r'["\']?\s*/?>\s*$', '', performer).strip()
+                    # 去前缀 - 号（如 -葉山さゆり）
+                    performer = performer.lstrip("-").strip()
                     # 统一分隔符：顿号/全角空格/制表符 → 半角空格
                     performer = re.sub(r"[、，,\t　]", " ", performer)
                     # 去尾部残留标点
@@ -1703,6 +1758,7 @@ class SyaApp:
 
     def _crawl_done(self):
         self.btn_crawl_start.config(state=tk.NORMAL)
+        self.btn_offline_crawl.config(state=tk.NORMAL)
         self.btn_crawl_stop.config(state=tk.DISABLED)
         self.crawl_status.set("就绪")
         self.crawl_progress["value"] = 100
@@ -1737,6 +1793,1133 @@ class SyaApp:
         )
         self.crawl_result.insert(tk.END, stats_text)
         self.crawl_result.config(state=tk.DISABLED)
+
+    # ================================================================
+    #  离线爬取：爬取帖子并下载所有资源，保存为可本地浏览的完整网页
+    # ================================================================
+
+    # 离线爬取保留分区白名单
+    _KEEP_SECTIONS = {
+        "高清中文字幕", "综合讨论区", "其他", "TXT小说下载",
+        "武侠虚幻", "激情都市", "青春校园", "原创小说", "卡通动漫",
+    }
+
+    # 离线网页根目录
+    _OFFLINE_ROOT = os.path.join(".", "output", "离线网页")
+    _OFFLINE_RES = os.path.join(".", "output", "离线网页", "_res")
+    _OFFLINE_DL_JSON = os.path.join(".", "output", "离线网页", "_downloaded.json")
+    _OFFLINE_SRC_ROOT = os.path.join(".", "output", "高清中文字幕网页源文件")
+
+    @staticmethod
+    def _sanitize_dirname(name):
+        """清理目录名中的非法字符，并截断到合理长度"""
+        cleaned = re.sub(r'[\\/:*?"<>|]', '', name).strip().strip('.')
+        return cleaned[:80] if len(cleaned) > 80 else cleaned
+
+    @staticmethod
+    def _extract_title_summary(title, max_len=30):
+        """从标题中提取摘要用于目录名，截断到 max_len 字符"""
+        # 去除 HTML 实体和多余空白
+        summary = title.replace("&nbsp;", " ").strip()
+        summary = re.sub(r'\s+', ' ', summary)
+        if len(summary) > max_len:
+            summary = summary[:max_len]
+        return summary
+
+    def _start_offline_crawl(self):
+        """启动离线爬取：爬取帖子并下载所有资源，保存为可本地浏览的完整网页"""
+        try:
+            begin = int(self.offline_crawl_begin.get())
+            end = int(self.offline_crawl_end.get())
+            threads = int(self.crawl_threads.get())
+        except ValueError:
+            messagebox.showerror("输入错误", "帖号和线程数必须为整数")
+            return
+
+        if begin >= end:
+            messagebox.showerror("输入错误", "起始帖号必须小于结束帖号")
+            return
+
+        try:
+            offline_concurrent = int(self.offline_concurrent.get())
+        except ValueError:
+            offline_concurrent = 1
+        offline_concurrent = max(1, min(offline_concurrent, 4))
+
+        self.crawl_running = True
+        self._crawl_stop_reason = ""
+        self._crawl_verify_post_id = begin
+        self.crawl_stats = {"fail": 0, "other": 0, "offline_saved": 0}
+        self._cookie_invalid_count = 0
+        self._last_success_time = 0
+        self._crawl_processed = 0
+        self._crawl_total = end - begin
+        self.btn_crawl_start.config(state=tk.DISABLED)
+        self.btn_offline_crawl.config(state=tk.DISABLED)
+        self.btn_crawl_stop.config(state=tk.NORMAL)
+        self.crawl_status.set("离线爬取中...")
+        self.crawl_progress["value"] = 0
+        self.crawl_progress_label.set("0/{}".format(self._crawl_total))
+
+        self.crawl_result.config(state=tk.NORMAL)
+        self.crawl_result.delete(1.0, tk.END)
+        self.crawl_result.insert(tk.END, "离线爬取中，请等待完成...\n")
+        self.crawl_result.config(state=tk.DISABLED)
+
+        t = threading.Thread(
+            target=self._offline_crawl_worker,
+            args=(begin, end, offline_concurrent),
+            daemon=True,
+        )
+        t.start()
+
+    def _offline_crawl_worker(self, begin, end, concurrent_pages):
+        """离线爬取工作线程：并发下载帖子页面及所有资源，保存为本地网页"""
+        base = self.base_url.get().strip().rstrip("/")
+        total = end - begin
+        self._log("[离线] 开始离线爬取：{} - {}，共 {} 个帖子，并发页数：{}".format(
+            begin, end, total, concurrent_pages))
+
+        # 读取 Cookie
+        try:
+            cookie = parse_cookie_file(self.cookie_path.get())
+            self._log("[离线] Cookie 读取成功，共 {} 条".format(len(cookie)))
+        except Exception as e:
+            self._log("[离线] 读取 Cookie 失败：{}".format(e))
+            self.root.after(0, self._offline_crawl_done)
+            return
+
+        # 预验证 Cookie
+        self._log("[离线] 正在验证 Cookie 有效性...")
+        try:
+            test_url = "https://{}/thread-{}-1-1.html".format(base, begin)
+            test_html = get_url_txt(test_url, cookie)
+            if self._is_login_page(test_html):
+                self._log("[离线] Cookie无效！测试页面返回登录页，请更新Cookie后重试")
+                self._crawl_stop_reason = "cookie_invalid"
+                self.root.after(0, self._offline_crawl_done)
+                return
+            self._last_success_time = time.time()
+            self._log("[离线] Cookie 验证通过")
+        except Exception as e:
+            self._log("[离线] Cookie验证请求失败：{}，将继续尝试".format(e))
+
+        # 加载已下载记录（去重）
+        downloaded = {}
+        try:
+            if os.path.exists(self._OFFLINE_DL_JSON):
+                with open(self._OFFLINE_DL_JSON, "r", encoding="utf-8") as f:
+                    downloaded = json.load(f)
+            self._log("[离线] 已加载 {} 条下载记录".format(len(downloaded)))
+        except Exception:
+            downloaded = {}
+
+        # 确保目录存在
+        os.makedirs(self._OFFLINE_ROOT, exist_ok=True)
+        os.makedirs(self._OFFLINE_RES, exist_ok=True)
+        os.makedirs(self._OFFLINE_SRC_ROOT, exist_ok=True)
+
+        # 构建待处理帖子列表（跳过已保存的）
+        all_ids = list(range(begin, end))
+        pending_ids = [pid for pid in all_ids if str(pid) not in downloaded or downloaded[str(pid)].get("status") != "saved"]
+        skipped_count = len(all_ids) - len(pending_ids)
+        if skipped_count > 0:
+            self._log("[离线] 跳过已保存的 {} 个帖子".format(skipped_count))
+
+        # 按并发页数分批处理
+        batch_size = concurrent_pages
+        batches = [pending_ids[i:i + batch_size] for i in range(0, len(pending_ids), batch_size)]
+
+        # 并发进度跟踪
+        worker_status = {}  # {worker_idx: {"current": pid, "status": "...", "done": N}}
+        last_heartbeat = time.time()
+
+        for batch_idx, batch in enumerate(batches):
+            if not self.crawl_running:
+                self._log("[离线] 爬取被用户中断")
+                break
+
+            if self._crawl_stop_reason == "cookie_invalid":
+                self._log("[离线] Cookie失效，终止爬取")
+                break
+
+            # 使用 ThreadPoolExecutor 并发处理当前批次
+            with ThreadPoolExecutor(max_workers=concurrent_pages) as executor:
+                futures = {}
+                for w_idx, post_id in enumerate(batch):
+                    future = executor.submit(
+                        self._offline_process_post,
+                        post_id, base, cookie, downloaded,
+                    )
+                    futures[future] = post_id
+                    worker_status[w_idx] = {"current": post_id, "status": "processing", "done": 0}
+
+                for future in as_completed(futures):
+                    post_id = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self._log("[离线] post={} 处理异常: {}".format(post_id, e))
+
+                    # 更新进度
+                    with self._crawl_processed_lock:
+                        self._crawl_processed += 1
+                        done = self._crawl_processed
+                        tot = self._crawl_total
+                    pct = done * 100 // tot if tot > 0 else 0
+                    self.root.after(0, self._update_progress, pct, done, tot)
+
+            # 保存下载记录（每批次后持久化）
+            with self._offline_dl_lock:
+                try:
+                    with open(self._OFFLINE_DL_JSON, "w", encoding="utf-8") as f:
+                        json.dump(downloaded, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    self._log("[离线] 保存下载记录失败: {}".format(e))
+
+            # 心跳汇报（并发>1时，每30秒输出一次进度摘要）
+            if concurrent_pages > 1 and time.time() - last_heartbeat > 30:
+                last_heartbeat = time.time()
+                with self._crawl_processed_lock:
+                    done = self._crawl_processed
+                    tot = self._crawl_total
+                self._log("[离线] 心跳 | 进度: {}/{} ({}%) | 已保存: {}".format(
+                    done, tot, done * 100 // tot if tot > 0 else 0,
+                    self.crawl_stats.get("offline_saved", 0)))
+
+        # 最终保存下载记录
+        with self._offline_dl_lock:
+            try:
+                with open(self._OFFLINE_DL_JSON, "w", encoding="utf-8") as f:
+                    json.dump(downloaded, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        # 生成全量索引
+        try:
+            self._generate_offline_index()
+            self._log("[离线] 主页/分区页已生成")
+        except Exception as e:
+            self._log("[离线] 生成索引失败: {}".format(e))
+
+        # 输出统计
+        self._log("=" * 50)
+        if self._crawl_stop_reason == "cookie_invalid":
+            self._log("[离线] Cookie失效，爬取终止！")
+        elif not self.crawl_running:
+            self._log("[离线] 用户手动停止")
+        else:
+            self._log("[离线] 爬取完成！")
+        self._log("[离线] 已保存: {} | 请求失败: {} | 跳过(无效/非白名单): {}".format(
+            self.crawl_stats.get("offline_saved", 0),
+            self.crawl_stats.get("fail", 0),
+            self.crawl_stats.get("other", 0),
+        ))
+        self._log("[离线] 进度: {}/{}".format(self._crawl_processed, self._crawl_total))
+
+        self.root.after(0, self._offline_crawl_done)
+
+    def _offline_process_post(self, post_id, base, cookie, downloaded):
+        """处理单个离线帖子：请求页面 → 验证 → 提取信息 → 下载资源 → 改写HTML → 保存"""
+        pid_str = str(post_id)
+        thread_id = threading.current_thread().name
+
+        if not self.crawl_running:
+            return
+
+        url = "https://{}/thread-{}-1-1.html".format(base, post_id)
+
+        # 1. 请求页面
+        try:
+            html = get_url_txt(url, cookie)
+        except Exception as e:
+            self._log("[离线][{}] post={} 请求失败: {}".format(thread_id, post_id, e))
+            self.crawl_stats["fail"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "fail", "skip_reason": "request_error"}
+            return
+
+        # 2. 检查页面有效性
+        if len(html) < 500:
+            if self._is_login_page(html):
+                self._log("[离线][{}] post={} 页面为登录页，Cookie可能失效".format(thread_id, post_id))
+                with self._cookie_invalid_lock:
+                    self._cookie_invalid_count += 1
+                    if self._cookie_invalid_count >= self._cookie_invalid_threshold:
+                        self.crawl_running = False
+                        self._crawl_stop_reason = "cookie_invalid"
+            else:
+                self._log("[离线][{}] post={} 页面无效（仅{}字节）".format(thread_id, post_id, len(html)))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "page_too_short"}
+            return
+
+        if self._is_login_page(html):
+            self._log("[离线][{}] post={} 页面为登录页，Cookie可能失效".format(thread_id, post_id))
+            with self._cookie_invalid_lock:
+                self._cookie_invalid_count += 1
+                if self._cookie_invalid_count >= self._cookie_invalid_threshold:
+                    self.crawl_running = False
+                    self._crawl_stop_reason = "cookie_invalid"
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "login_page"}
+            return
+
+        # 页面有效，重置 Cookie 失效计数
+        with self._cookie_invalid_lock:
+            self._cookie_invalid_count = 0
+
+        # 3. Cookie二次验证：距上次成功超过60秒则验证
+        now = time.time()
+        if self._crawl_verify_post_id and now - self._last_success_time > 60:
+            verify_url = "https://{}/thread-{}-1-1.html".format(base, self._crawl_verify_post_id)
+            try:
+                verify_html = get_url_txt(verify_url, cookie)
+                if self._is_login_page(verify_html) or len(verify_html) < 500:
+                    self._log("[离线][{}] Cookie二次验证失败！终止爬取".format(thread_id))
+                    self.crawl_running = False
+                    self._crawl_stop_reason = "cookie_invalid"
+                    with self._offline_dl_lock:
+                        downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "cookie_verify_fail"}
+                    return
+                self._last_success_time = time.time()
+            except Exception:
+                pass  # 验证请求失败不终止，继续
+
+        self._last_success_time = time.time()
+
+        # 4. 提取标题 → page_name
+        pos1 = html.find("<title>")
+        pos2 = html.find("</title>")
+        title = ""
+        if pos1 != -1 and pos2 != -1:
+            title = html[pos1 + 7:pos2].strip()
+
+        # 尝试从标题提取番号
+        fanhao = ""
+        cleaned_title = title
+        prefix_tags = ["[中文字幕]", "[无码]", "[高清]", "[原档]", "[破解]", "[字幕]", "[无码破解]", "[FC2]"]
+        for tag in prefix_tags:
+            if cleaned_title.startswith(tag):
+                cleaned_title = cleaned_title[len(tag):].strip()
+
+        bracket_pos = cleaned_title.find("[")
+        if bracket_pos == -1:
+            fanhao = cleaned_title.split(" - ")[0].strip()
+        else:
+            fanhao = cleaned_title[:bracket_pos - 1].strip() if bracket_pos > 0 else cleaned_title.split(" - ")[0].strip()
+
+        # 番号后缀
+        if "无码破解" in title:
+            fanhao += "-UC"
+        elif "自译征用" in title or "自提征用" in title:
+            fanhao += "-C"
+
+        # 构建 page_name
+        if fanhao and len(fanhao) <= 80:
+            summary = self._extract_title_summary(title, 30)
+            page_name = "post_{}_{}".format(post_id, fanhao)
+            if summary:
+                page_name += "_" + summary
+        else:
+            summary = self._extract_title_summary(title, 30)
+            if summary:
+                page_name = "post_{}_{}".format(post_id, summary)
+            else:
+                page_name = "post_{}".format(post_id)
+
+        page_name = self._sanitize_dirname(page_name)
+
+        # 5. 提取发布日期
+        pub_date = "未知日期"
+        # 格式1: 发表于 2026-03-19
+        date_match = re.search(r'发表于\s*(\d{4}-\d{2}-\d{2})', html)
+        if date_match:
+            pub_date = date_match.group(1)
+        else:
+            # 格式2: title="2026-04-16"
+            date_matches = re.findall(r'title="(\d{4}-\d{2}-\d{2})"', html)
+            if date_matches:
+                pub_date = date_matches[0]
+        date_dir = self._sanitize_dirname(pub_date)
+
+        # 6. 提取分区名（同时支持新老格式）
+        section_name = "其他"
+        section_matches = re.findall(r'<a[^>]*href="forum\-\d+\-1\.html"[^>]*>([^<]+)</a>', html)
+        if not section_matches:
+            section_matches = re.findall(r'<a[^>]*href="forum\.php\?mod=forumdisplay[^"]*"[^>]*>([^<]+)</a>', html)
+        for s in section_matches:
+            if s != "返回列表":
+                section_name = s
+                break
+        section_dir = self._sanitize_dirname(section_name.strip())
+
+        # 7. 分区白名单过滤
+        if section_name not in self._KEEP_SECTIONS:
+            self._log("[离线][{}] post={} 跳过（分区不在白名单: {}）".format(thread_id, post_id, section_name))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {
+                    "name": page_name, "section": section_name, "date": pub_date,
+                    "status": "skipped", "skip_reason": "section_not_in_whitelist",
+                }
+            return
+
+        # 8. 创建帖子目录
+        post_dir = os.path.join(self._OFFLINE_ROOT, section_dir, date_dir, page_name)
+        os.makedirs(post_dir, exist_ok=True)
+
+        # 9. 下载帖子图片（zoomfile + src，带Referer防盗链）
+        img_urls = set()
+        for m in re.finditer(r'(?:zoomfile|file|src)\s*=\s*["\']([^"\']+\.(?:jpg|jpeg|png|gif|webp|bmp))', html, re.IGNORECASE):
+            img_urls.add(m.group(1))
+
+        # 过滤掉 data: URI 和空值
+        img_urls = {u for u in img_urls if u and not u.startswith("data:")}
+
+        downloaded_imgs = {}  # {原始URL: 本地相对路径}
+
+        def _download_single_img(img_url):
+            """下载单张图片，返回 (原始URL, 本地文件名) 或 None"""
+            try:
+                # 补全 URL
+                if img_url.startswith("//"):
+                    full_url = "https:" + img_url
+                elif img_url.startswith("/"):
+                    full_url = "https://" + base + img_url
+                elif img_url.startswith("http"):
+                    full_url = img_url
+                else:
+                    full_url = "https://" + base + "/" + img_url
+
+                # 文件名用 basename
+                parsed = urlparse(full_url)
+                img_filename = os.path.basename(parsed.path)
+                if not img_filename:
+                    img_filename = "img_{}.jpg".format(hash(img_url) % 100000)
+
+                img_local_path = os.path.join(post_dir, img_filename)
+                if os.path.exists(img_local_path):
+                    return (img_url, img_filename)
+
+                resp = requests.get(
+                    full_url,
+                    headers={"Referer": "https://" + base, "User-Agent": HEADERS["User-Agent"]},
+                    timeout=(5, 15),
+                )
+                if resp.status_code == 200 and len(resp.content) > 0:
+                    with open(img_local_path, "wb") as f:
+                        f.write(resp.content)
+                    return (img_url, img_filename)
+            except Exception:
+                pass
+            return None
+
+        if img_urls:
+            with ThreadPoolExecutor(max_workers=4) as img_executor:
+                img_futures = {img_executor.submit(_download_single_img, u): u for u in img_urls}
+                for future in as_completed(img_futures):
+                    result = future.result()
+                    if result:
+                        downloaded_imgs[result[0]] = result[1]
+
+        # 10. 下载 CSS/JS 到共享目录
+        css_js_urls = set()
+        for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:css|js))', html, re.IGNORECASE):
+            css_js_urls.add(m.group(1))
+
+        css_js_urls = {u for u in css_js_urls if u and not u.startswith("data:")}
+
+        downloaded_res = {}  # {原始URL: 本地文件名}
+
+        for res_url in css_js_urls:
+            try:
+                if res_url.startswith("//"):
+                    full_url = "https:" + res_url
+                elif res_url.startswith("/"):
+                    full_url = "https://" + base + res_url
+                elif res_url.startswith("http"):
+                    full_url = res_url
+                else:
+                    full_url = "https://" + base + "/" + res_url
+
+                parsed = urlparse(full_url)
+                res_filename = os.path.basename(parsed.path)
+                if not res_filename:
+                    res_filename = "res_{}".format(hash(res_url) % 100000)
+
+                res_local_path = os.path.join(self._OFFLINE_RES, res_filename)
+                if not os.path.exists(res_local_path):
+                    resp = requests.get(
+                        full_url,
+                        headers={"Referer": "https://" + base, "User-Agent": HEADERS["User-Agent"]},
+                        timeout=(5, 15),
+                    )
+                    if resp.status_code == 200 and len(resp.content) > 0:
+                        with open(res_local_path, "wb") as f:
+                            f.write(resp.content)
+                downloaded_res[res_url] = res_filename
+            except Exception:
+                pass
+
+        # 11. HTML改写
+        rewritten_html = html
+
+        # 删 <base href> 标签
+        rewritten_html = re.sub(r'<base[^>]*href="[^"]*"[^>]*/?>', '', rewritten_html, flags=re.IGNORECASE)
+
+        # 图片 src 改本地路径
+        for orig_url, local_name in downloaded_imgs.items():
+            # 构建从帖子目录到图片的相对路径（图片就在帖子目录内）
+            local_rel = local_name
+            # 替换所有出现该URL的 src/zoomfile/file 属性
+            # 先转义URL中的正则特殊字符
+            escaped_url = re.escape(orig_url)
+            rewritten_html = re.sub(
+                r'((?:zoomfile|file|src)\s*=\s*["\'])' + escaped_url + r'(["\'])',
+                r'\1' + local_rel + r'\2',
+                rewritten_html,
+                flags=re.IGNORECASE,
+            )
+
+        # static/ 开头的路径补全为 https://{domain}/static/
+        rewritten_html = re.sub(
+            r'((?:href|src)\s*=\s*["\'])/?(static/)',
+            r'\1https://' + base + r'/\2',
+            rewritten_html,
+            flags=re.IGNORECASE,
+        )
+
+        # CSS/JS 改相对路径 → ../../_res/filename
+        # 计算从帖子目录到 _res 的相对路径
+        # 帖子目录: output/离线网页/{section}/{date}/{page_name}/
+        # _res 目录: output/离线网页/_res/
+        # 相对路径: ../../_res/
+        res_rel_prefix = "../../_res/"
+        for orig_url, local_name in downloaded_res.items():
+            escaped_url = re.escape(orig_url)
+            rewritten_html = re.sub(
+                r'((?:href|src)\s*=\s*["\'])' + escaped_url + r'(["\'])',
+                r'\1' + res_rel_prefix + local_name + r'\2',
+                rewritten_html,
+                flags=re.IGNORECASE,
+            )
+
+        # 12. 保存 index.html
+        index_path = os.path.join(post_dir, "index.html")
+        try:
+            with open(index_path, "w", encoding="utf-8") as f:
+                f.write(rewritten_html)
+        except Exception as e:
+            self._log("[离线][{}] post={} 保存index.html失败: {}".format(thread_id, post_id, e))
+
+        # 13. 同步保存源文件到 output/高清中文字幕网页源文件/{日期}/
+        try:
+            src_dir = os.path.join(self._OFFLINE_SRC_ROOT, date_dir)
+            os.makedirs(src_dir, exist_ok=True)
+            src_path = os.path.join(src_dir, "{}.txt".format(page_name))
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception as e:
+            self._log("[离线][{}] post={} 保存源文件失败: {}".format(thread_id, post_id, e))
+
+        # 14. 调用 _offline_crawl_insert 同步入库
+        try:
+            self._offline_crawl_insert(html, page_name, post_id, url)
+        except Exception as e:
+            self._log("[离线][{}] post={} 入库异常: {}".format(thread_id, post_id, e))
+
+        # 15. 记录到 _downloaded.json
+        with self._offline_dl_lock:
+            downloaded[pid_str] = {
+                "name": page_name,
+                "section": section_name,
+                "date": pub_date,
+                "status": "saved",
+                "skip_reason": "",
+            }
+
+        self.crawl_stats["offline_saved"] = self.crawl_stats.get("offline_saved", 0) + 1
+        self._log("[离线][{}] post={} 已保存 → {}/{}/{}/".format(
+            thread_id, post_id, section_dir, date_dir, page_name))
+
+        # 16. 增量更新主页 + 分区页 + 搜索数据
+        try:
+            self._update_offline_index(section_name, pub_date, page_name, post_dir, post_id)
+        except Exception as e:
+            self._log("[离线][{}] post={} 更新索引失败: {}".format(thread_id, post_id, e))
+
+    def _offline_crawl_insert(self, html, page_name, post_id, url):
+        """离线爬取入库逻辑：复用普通爬取的11步过滤，不符合条件的静默跳过"""
+        thread_id = threading.current_thread().name
+
+        # 1. 提取磁力链接
+        mag = re.findall(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+", str(html))
+        if not mag:
+            return
+
+        # 2. 提取标题
+        pos1 = html.find("<title>")
+        pos2 = html.find("</title>")
+        if pos1 == -1 or pos2 == -1:
+            return
+        title = html[pos1 + 7:pos2]
+
+        # 3. 番号判断
+        cleaned_title = title
+        prefix_tags = ["[中文字幕]", "[无码]", "[高清]", "[原档]", "[破解]", "[字幕]", "[无码破解]", "[FC2]"]
+        for tag in prefix_tags:
+            if cleaned_title.startswith(tag):
+                cleaned_title = cleaned_title[len(tag):].strip()
+
+        bracket_pos = cleaned_title.find("[")
+        if bracket_pos == -1:
+            fanhao = cleaned_title.split(" - ")[0].strip()
+            if not fanhao:
+                return
+        else:
+            fanhao = cleaned_title[:bracket_pos - 1].strip()
+
+        if len(fanhao) > 80:
+            return
+
+        designation = fanhao
+        cn_type = ""
+        if "无码破解" in title:
+            fanhao += "-UC"
+            cn_type = "无码破解"
+        elif "自译征用" in title:
+            fanhao += "-C"
+            cn_type = "自译征用"
+        elif "自提征用" in title:
+            fanhao += "-C"
+            cn_type = "自提征用"
+        else:
+            # 非中文，跳过
+            return
+
+        # 4. 热度
+        hot_num = 0
+        try:
+            hot_num = int(re.findall(r"热度: [0-9]+", html)[0][4:])
+        except (IndexError, ValueError):
+            pass
+
+        # 5. 演员
+        performer = self._extract_field(html, "出演女优", "unknown")
+        if performer and performer != "unknown":
+            if performer.strip().lower() in ("zzz", "zzz ", " zzz", "未知", "无"):
+                performer = "unknown"
+            else:
+                performer = re.sub(r"^【[^】]*】[：:]\s*", "", performer)
+                if not performer.startswith("【"):
+                    performer = re.sub(r"【[^】]*】.*$", "", performer).strip()
+                performer = re.sub(r'["\']?\s*/?>\s*$', '', performer).strip()
+                performer = performer.lstrip("-").strip()
+                performer = re.sub(r"[、，,\t　]", " ", performer)
+                performer = performer.rstrip(".;。、,，/\\")
+                performer = re.sub(r"\s+", " ", performer).strip()
+
+        # 6. 大小
+        size = self._extract_field(html, "影片容量", "unknown")
+
+        # 7. 有码
+        mosaic = self._extract_field(html, "是否有码", "unknown")
+        if mosaic and mosaic != "unknown":
+            mosaic_lower = mosaic.lower()
+            if any(kw in mosaic_lower for kw in ("有码", "马赛克", "モザイク", "mosaic")):
+                mosaic = "有码"
+            elif any(kw in mosaic_lower for kw in ("无码", "無码", "無修正", "无修正", " uncensored", "破解")):
+                mosaic = "无码"
+
+        # 8. 查看/回复
+        view, reply = 0, 0
+        for line in html.splitlines():
+            if "查看:" in line:
+                ret = re.findall(r">[0-9]+<", line)
+                if len(ret) >= 2:
+                    view = int(ret[0][1:-1])
+                    reply = int(ret[1][1:-1])
+
+        # 9. 影片名称
+        film_name = self._extract_field(html, "影片名称", "unknown")
+
+        self._log("[离线+入库][{}] post={} | 番号={} | 类型={} | 演员={} | 热度={}".format(
+            thread_id, post_id, fanhao, cn_type, performer[:30], hot_num))
+
+        # 10. 写磁力文件
+        try:
+            day_name = time.strftime("%Y-%m-%d")
+            os.makedirs("./output/magnet", exist_ok=True)
+            with open("./output/magnet/{}-magnet.txt".format(day_name), "a", encoding="utf-8") as f:
+                if "-UC" not in fanhao:
+                    if not judge_performer(performer):
+                        f.write(mag[0] + "\n")
+        except Exception:
+            pass
+
+        # 11. 跳过欧美片
+        if is_western_designation(designation):
+            return
+
+        # 12. 查重
+        existing = judge_current_film_is_exist(designation)
+        if existing:
+            existing_key, existing_magnet, existing_extra = existing
+            if mag[0] != existing_magnet:
+                extra_entry = "[{}] {}|||{}".format(mosaic, fanhao, mag[0])
+                new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
+                link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
+                self._log("[离线+入库][{}] post={} 合并磁力 | 番号={}".format(thread_id, post_id, designation))
+            self.crawl_stats.setdefault("exist", 0)
+            self.crawl_stats["exist"] += 1
+            return
+
+        # 13. 入库
+        try:
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            db_params = [fanhao, title, mag[0], hot_num, performer, size, mosaic, view, reply, designation, film_name, now_str, now_str]
+            link_db_cmd(
+                "INSERT INTO av (numbers_name, name, magnet, hot_num, performer, size, mosaic, view, reply, designation, film_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                db_params,
+            )
+            self._log("[离线+入库][{}] post={} 入库成功 | 番号={}".format(thread_id, post_id, fanhao))
+            self.crawl_stats.setdefault("new", 0)
+            self.crawl_stats["new"] += 1
+        except sqlite3.IntegrityError:
+            existing = judge_current_film_is_exist(designation)
+            if existing:
+                existing_key, existing_magnet, existing_extra = existing
+                if mag[0] != existing_magnet:
+                    extra_entry = "[{}] {}|||{}".format(mosaic, fanhao, mag[0])
+                    new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
+                    link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
+            self.crawl_stats.setdefault("exist", 0)
+            self.crawl_stats["exist"] += 1
+        except Exception as e:
+            self._log("[离线+入库][{}] post={} 入库失败: {}".format(thread_id, post_id, e))
+
+    def _offline_crawl_done(self):
+        """离线爬取完成回调：恢复按钮状态，写统计报告"""
+        self.btn_crawl_start.config(state=tk.NORMAL)
+        self.btn_offline_crawl.config(state=tk.NORMAL)
+        self.btn_crawl_stop.config(state=tk.DISABLED)
+        self.crawl_status.set("就绪")
+        self.crawl_progress["value"] = 100
+        self.crawl_progress_label.set("{}/{} (100%)".format(self._crawl_processed, self._crawl_total))
+
+        # 写统计报告
+        self.crawl_result.config(state=tk.NORMAL)
+        self.crawl_result.delete(1.0, tk.END)
+
+        stats = self.crawl_stats
+        report_lines = [
+            "=" * 50,
+            "离线爬取统计报告",
+            "=" * 50,
+            "处理总数:       {}".format(self._crawl_processed),
+            "已保存网页:     {}".format(stats.get("offline_saved", 0)),
+            "请求失败:       {}".format(stats.get("fail", 0)),
+            "跳过(无效/非白名单): {}".format(stats.get("other", 0)),
+            "入库新增:       {}".format(stats.get("new", 0)),
+            "入库已存在:     {}".format(stats.get("exist", 0)),
+        ]
+        if self._crawl_stop_reason == "cookie_invalid":
+            report_lines.append("")
+            report_lines.append("⚠ Cookie失效，爬取被终止！请更新Cookie后重新爬取")
+        elif not self.crawl_running:
+            report_lines.append("")
+            report_lines.append("⚠ 爬取被用户手动停止")
+        report_lines.append("=" * 50)
+        report_lines.append("时间: {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+
+        self.crawl_result.insert(tk.END, "\n".join(report_lines) + "\n")
+        self.crawl_result.config(state=tk.DISABLED)
+
+    # ----------------------------------------------------------------
+    #  离线网页索引生成：主页 + 分区页 + 搜索数据
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _extract_post_meta(index_html_path):
+        """从帖子的 index.html 提取元数据（标题、浏览、回复、热度、标签）"""
+        meta = {
+            "title": "",
+            "view": 0,
+            "reply": 0,
+            "hot": 0,
+            "tags": [],
+        }
+        try:
+            with open(index_html_path, "r", encoding="utf-8") as f:
+                html = f.read()
+
+            # 标题
+            pos1 = html.find("<title>")
+            pos2 = html.find("</title>")
+            if pos1 != -1 and pos2 != -1:
+                meta["title"] = html[pos1 + 7:pos2].strip()
+
+            # 浏览/回复
+            for line in html.splitlines():
+                if "查看:" in line:
+                    ret = re.findall(r">[0-9]+<", line)
+                    if len(ret) >= 2:
+                        meta["view"] = int(ret[0][1:-1])
+                        meta["reply"] = int(ret[1][1:-1])
+                    break
+
+            # 热度
+            try:
+                hot_match = re.findall(r"热度: [0-9]+", html)
+                if hot_match:
+                    meta["hot"] = int(hot_match[0][4:])
+            except (IndexError, ValueError):
+                pass
+
+            # 标签（提取 [中文字幕] [无码] 等前缀标签）
+            tag_matches = re.findall(r'\[(中文字幕|无码|高清|原档|破解|字幕|无码破解|FC2)\]', html[:500])
+            meta["tags"] = list(set(tag_matches))
+
+        except Exception:
+            pass
+        return meta
+
+    def _collect_offline_posts(self):
+        """遍历离线网页目录，收集所有已保存帖子的信息"""
+        posts = []  # [{section, date, name, path, post_id, title, view, reply, hot, tags}]
+        if not os.path.exists(self._OFFLINE_ROOT):
+            return posts
+
+        for section_name in os.listdir(self._OFFLINE_ROOT):
+            section_path = os.path.join(self._OFFLINE_ROOT, section_name)
+            if not os.path.isdir(section_path) or section_name.startswith("_"):
+                continue
+
+            for date_name in os.listdir(section_path):
+                date_path = os.path.join(section_path, date_name)
+                if not os.path.isdir(date_path):
+                    continue
+
+                for page_name in os.listdir(date_path):
+                    page_path = os.path.join(date_path, page_name)
+                    if not os.path.isdir(page_path):
+                        continue
+
+                    index_html = os.path.join(page_path, "index.html")
+                    if not os.path.exists(index_html):
+                        continue
+
+                    # 从 page_name 提取 post_id
+                    post_id = 0
+                    m = re.match(r'post_(\d+)_', page_name)
+                    if m:
+                        post_id = int(m.group(1))
+
+                    meta = self._extract_post_meta(index_html)
+                    posts.append({
+                        "section": section_name,
+                        "date": date_name,
+                        "name": page_name,
+                        "path": page_path,
+                        "post_id": post_id,
+                        "title": meta["title"],
+                        "view": meta["view"],
+                        "reply": meta["reply"],
+                        "hot": meta["hot"],
+                        "tags": meta["tags"],
+                    })
+
+        return posts
+
+    def _update_offline_index(self, section_name, pub_date, page_name, post_dir, post_id):
+        """增量更新分区页（单个帖子保存后调用）"""
+        section_dir = self._sanitize_dirname(section_name)
+        date_dir = self._sanitize_dirname(pub_date)
+
+        # 帖子相对路径（从分区页所在目录到帖子目录）
+        # 分区页路径: output/离线网页/{section}/index.html
+        # 帖子路径: output/离线网页/{section}/{date}/{page_name}/index.html
+        post_rel_path = "{}/{}/index.html".format(date_dir, page_name)
+
+        # 提取帖子元数据
+        index_html_path = os.path.join(post_dir, "index.html")
+        meta = self._extract_post_meta(index_html_path)
+
+        # 更新搜索数据
+        self._update_search_data(section_name, pub_date, page_name, post_rel_path, post_id, meta)
+
+        # 重新生成分区页
+        section_index_path = os.path.join(self._OFFLINE_ROOT, section_dir, "index.html")
+        self._generate_section_page(section_dir, section_name)
+
+        # 刷新主页
+        self._generate_offline_homepage()
+
+    def _generate_section_page(self, section_dir, section_name):
+        """生成分区索引页"""
+        section_path = os.path.join(self._OFFLINE_ROOT, section_dir)
+        if not os.path.exists(section_path):
+            return
+
+        # 收集该分区下所有帖子
+        posts = []
+        for date_name in os.listdir(section_path):
+            date_path = os.path.join(section_path, date_name)
+            if not os.path.isdir(date_path):
+                continue
+            for page_name in os.listdir(date_path):
+                page_path = os.path.join(date_path, page_name)
+                if not os.path.isdir(page_path):
+                    continue
+                index_html = os.path.join(page_path, "index.html")
+                if not os.path.exists(index_html):
+                    continue
+
+                post_id = 0
+                m = re.match(r'post_(\d+)_', page_name)
+                if m:
+                    post_id = int(m.group(1))
+
+                meta = self._extract_post_meta(index_html)
+                posts.append({
+                    "name": page_name,
+                    "date": date_name,
+                    "rel_path": "{}/{}/index.html".format(date_name, page_name),
+                    "post_id": post_id,
+                    "title": meta["title"],
+                    "view": meta["view"],
+                    "reply": meta["reply"],
+                    "hot": meta["hot"],
+                    "tags": meta["tags"],
+                })
+
+        # 按日期降序排列
+        posts.sort(key=lambda p: p["date"], reverse=True)
+
+        # 生成 HTML
+        cards_html = []
+        for p in posts:
+            tags_html = ""
+            if p["tags"]:
+                tags_html = " ".join('<span class="tag">{}</span>'.format(t) for t in p["tags"])
+            cards_html.append(
+                '<div class="post-card">'
+                '<span class="tags">{}</span>'
+                '<a href="{}" class="title">{}</a>'
+                '<span class="stats">浏览:{} 回复:{} 热度:{}</span>'
+                '</div>'.format(
+                    tags_html,
+                    p["rel_path"],
+                    p["title"][:80] if p["title"] else p["name"],
+                    p["view"], p["reply"], p["hot"],
+                )
+            )
+
+        html_content = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{section_name} - 离线网页</title>
+<style>
+body {{ font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+h1 {{ color: #333; border-bottom: 2px solid #3366CC; padding-bottom: 10px; }}
+.back-link {{ margin-bottom: 16px; }}
+.back-link a {{ color: #3366CC; text-decoration: none; }}
+.post-card {{ display: flex; align-items: center; background: #fff; margin: 6px 0; padding: 10px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.post-card .tags {{ flex-shrink: 0; margin-right: 10px; }}
+.post-card .tag {{ display: inline-block; background: #e8f0fe; color: #3366CC; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin-right: 3px; }}
+.post-card .title {{ flex: 1; color: #333; text-decoration: none; font-size: 14px; }}
+.post-card .title:hover {{ color: #3366CC; }}
+.post-card .stats {{ flex-shrink: 0; color: #888; font-size: 12px; margin-left: 10px; }}
+.count {{ color: #888; margin-bottom: 12px; }}
+</style>
+</head>
+<body>
+<div class="back-link"><a href="../index.html">← 返回主页</a></div>
+<h1>{section_name}</h1>
+<div class="count">共 {count} 个帖子</div>
+{cards}
+</body>
+</html>""".format(
+            section_name=section_name,
+            count=len(posts),
+            cards="\n".join(cards_html) if cards_html else "<p>暂无帖子</p>",
+        )
+
+        section_index_path = os.path.join(section_path, "index.html")
+        try:
+            with open(section_index_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+        except Exception:
+            pass
+
+    def _generate_offline_homepage(self):
+        """生成离线网页主页（含搜索栏，搜索数据内嵌到 script 标签）"""
+        # 收集所有分区
+        sections = []
+        if os.path.exists(self._OFFLINE_ROOT):
+            for name in os.listdir(self._OFFLINE_ROOT):
+                if name.startswith("_"):
+                    continue
+                section_path = os.path.join(self._OFFLINE_ROOT, name)
+                if os.path.isdir(section_path):
+                    count = 0
+                    for date_name in os.listdir(section_path):
+                        date_path = os.path.join(section_path, date_name)
+                        if os.path.isdir(date_path):
+                            count += len([
+                                d for d in os.listdir(date_path)
+                                if os.path.isdir(os.path.join(date_path, d))
+                            ])
+                    sections.append({"name": name, "count": count})
+
+        # 收集搜索数据
+        search_data = self._load_search_data()
+
+        # 将搜索数据内嵌到 script 标签（file:// 下 fetch 不可用）
+        search_json = json.dumps(search_data, ensure_ascii=False)
+
+        sections_html = []
+        for s in sections:
+            sections_html.append(
+                '<div class="section-card">'
+                '<a href="{dir}/index.html" class="section-link">{name}</a>'
+                '<span class="section-count">{count} 个帖子</span>'
+                '</div>'.format(
+                    dir=s["name"], name=s["name"], count=s["count"],
+                )
+            )
+
+        html_content = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>离线网页主页</title>
+<style>
+body {{ font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; background: #f5f5f5; max-width: 900px; margin: 0 auto; }}
+h1 {{ color: #333; border-bottom: 2px solid #3366CC; padding-bottom: 10px; }}
+.search-bar {{ margin: 16px 0; }}
+.search-bar input {{ width: 60%; padding: 8px 12px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }}
+.search-bar button {{ padding: 8px 16px; font-size: 14px; background: #3366CC; color: #fff; border: none; border-radius: 4px; cursor: pointer; }}
+.search-results {{ margin: 12px 0; }}
+.search-results .post-card {{ display: flex; align-items: center; background: #fff; margin: 6px 0; padding: 10px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.search-results .post-card .title {{ flex: 1; color: #333; text-decoration: none; font-size: 14px; }}
+.search-results .post-card .title:hover {{ color: #3366CC; }}
+.search-results .post-card .meta {{ color: #888; font-size: 12px; margin-left: 10px; }}
+.section-card {{ display: flex; align-items: center; background: #fff; margin: 6px 0; padding: 12px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.section-link {{ flex: 1; color: #3366CC; text-decoration: none; font-size: 16px; font-weight: bold; }}
+.section-link:hover {{ text-decoration: underline; }}
+.section-count {{ color: #888; font-size: 13px; }}
+</style>
+</head>
+<body>
+<h1>离线网页</h1>
+<div class="search-bar">
+<input type="text" id="searchInput" placeholder="搜索帖子标题..." onkeyup="doSearch()">
+<button onclick="doSearch()">搜索</button>
+</div>
+<div class="search-results" id="searchResults"></div>
+<h2>分区列表</h2>
+{sections}
+<script>
+var searchData = {search_json};
+function doSearch() {{
+    var q = document.getElementById('searchInput').value.trim().toLowerCase();
+    var container = document.getElementById('searchResults');
+    if (!q) {{ container.innerHTML = ''; return; }}
+    var results = [];
+    for (var i = 0; i < searchData.length; i++) {{
+        var item = searchData[i];
+        if (item.title && item.title.toLowerCase().indexOf(q) >= 0) {{
+            results.push(item);
+        }}
+    }}
+    var html = '';
+    for (var i = 0; i < results.length; i++) {{
+        var r = results[i];
+        html += '<div class="post-card"><a href="' + r.path + '" class="title">' + r.title + '</a><span class="meta">' + r.section + ' | ' + r.date + '</span></div>';
+    }}
+    container.innerHTML = html || '<p style="color:#888;">未找到匹配结果</p>';
+}}
+</script>
+</body>
+</html>""".format(
+            sections="\n".join(sections_html) if sections_html else "<p>暂无分区</p>",
+            search_json=search_json,
+        )
+
+        homepage_path = os.path.join(self._OFFLINE_ROOT, "index.html")
+        try:
+            with open(homepage_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+        except Exception:
+            pass
+
+    def _generate_offline_index(self):
+        """全量生成主页 + 所有分区页"""
+        # 收集所有分区目录
+        if not os.path.exists(self._OFFLINE_ROOT):
+            return
+
+        section_dirs = []
+        for name in os.listdir(self._OFFLINE_ROOT):
+            if name.startswith("_"):
+                continue
+            section_path = os.path.join(self._OFFLINE_ROOT, name)
+            if os.path.isdir(section_path):
+                section_dirs.append(name)
+
+        # 为每个分区生成分区页
+        for section_dir in section_dirs:
+            self._generate_section_page(section_dir, section_dir)
+
+        # 生成主页
+        self._generate_offline_homepage()
+
+    def _load_search_data(self):
+        """加载搜索数据 JSON"""
+        search_file = os.path.join(self._OFFLINE_ROOT, "_search_data.json")
+        try:
+            if os.path.exists(search_file):
+                with open(search_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _update_search_data(self, section_name, pub_date, page_name, post_rel_path, post_id, meta):
+        """增量更新搜索数据"""
+        search_file = os.path.join(self._OFFLINE_ROOT, "_search_data.json")
+        search_data = self._load_search_data()
+
+        # 移除已有的同 post_id 记录
+        search_data = [item for item in search_data if item.get("post_id") != post_id]
+
+        # 添加新记录
+        search_data.append({
+            "post_id": post_id,
+            "title": meta.get("title", page_name),
+            "section": section_name,
+            "date": pub_date,
+            "path": "{}/{}/{}".format(
+                self._sanitize_dirname(section_name), post_rel_path
+            ),
+            "view": meta.get("view", 0),
+            "reply": meta.get("reply", 0),
+            "hot": meta.get("hot", 0),
+        })
+
+        try:
+            with open(search_file, "w", encoding="utf-8") as f:
+                json.dump(search_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # ============ Tab 2: 播放视频 ============
     # [ARCH] 如果将来拆分模块，可将 _build_video_tab 及其相关方法提取到 video_tab.py
@@ -6910,6 +8093,9 @@ a:hover {{ text-decoration: underline; }}
             self.config["crawl_end"] = self.crawl_end.get()
             self.config["crawl_threads"] = self.crawl_threads.get()
             self.config["cookie_path"] = self.cookie_path.get()
+            self.config["offline_concurrent"] = self.offline_concurrent.get()
+            self.config["offline_crawl_begin"] = self.offline_crawl_begin.get()
+            self.config["offline_crawl_end"] = self.offline_crawl_end.get()
             self.config["db_115_path"] = self.db_115_path.get()
             self.config["file_path"] = self.file_path.get()
             self.config["small_file_mb"] = self.small_file_mb.get()
