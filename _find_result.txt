@@ -1,0 +1,4 @@
+Total lines: 7003
+
+--- All def methods after L1680 ---
+1728:     def _crawl_done(self):

@@ -1711,32 +1711,37 @@ class SyaApp:
         self._log("[{}] 完成，处理了 {} 个帖子".format(thread_id, processed))
 
     def _is_login_page(self, html):
-        """检测页面是否为登录页（Cookie失效的标志）"""
+        """检测页面是否为登录页 / Cookie失效提示页"""
         if not html:
             return True
-        # Discuz 论坛登录页特征
+        # 正常帖子页面特征：有帖子内容区域，优先判断
+        if "postlist" in html or 'id="post_' in html or "ajaxdialog" in html:
+            return False
+        # 没有帖子内容 → 检查是否包含 Cookie 失效 / 登录页特征
+        # （不限制页面长度：论坛"提示信息"页通常 8000+ 字节但同样是 Cookie 失效页）
         login_signs = [
             "member.php?mod=logging",
             "action=login",
-            "登录",
             "请先登录",
             "您需要登录",
             "loginform",
             "type=login",
         ]
-        # 如果页面很短且包含登录特征，判定为登录页
-        if len(html) < 2000:
-            for sign in login_signs:
-                if sign in html:
-                    return True
-        # 正常帖子页面特征：有帖子内容区域
-        if "postlist" in html or "pid" in html or "ajaxdialog" in html:
-            return False
-        # 页面不太短但没有帖子内容，也检查登录特征
-        if len(html) < 5000:
-            for sign in login_signs:
-                if sign in html:
-                    return True
+        for sign in login_signs:
+            if sign in html:
+                return True
+        # Discuz "提示信息" 页面特征：<title>提示信息</title>
+        # Cookie 失效时论坛返回的提示页，内容包含"您需要登录"等文字
+        title = ""
+        pos1 = html.find("<title>")
+        pos2 = html.find("</title>")
+        if pos1 != -1 and pos2 != -1:
+            title = html[pos1 + 7:pos2].strip()
+            if title == "提示信息" or title.startswith("提示信息"):
+                return True
+        # 502 / 503 等服务器错误页也不是正常帖子
+        if "502 Bad Gateway" in title or "503 Service" in title:
+            return True
         return False
 
     def _report_cookie_invalid(self, thread_id, next_url):
@@ -2146,7 +2151,8 @@ class SyaApp:
         date_dir = self._sanitize_dirname(pub_date)
 
         # 6. 提取分区名（同时支持新老格式）
-        section_name = "其他"
+        # 注意：默认值用 "unknown" 而非 "其他"，避免提取失败时误入白名单
+        section_name = "unknown"
         section_matches = re.findall(r'<a[^>]*href="forum\-\d+\-1\.html"[^>]*>([^<]+)</a>', html)
         if not section_matches:
             section_matches = re.findall(r'<a[^>]*href="forum\.php\?mod=forumdisplay[^"]*"[^>]*>([^<]+)</a>', html)
@@ -2226,8 +2232,9 @@ class SyaApp:
                         downloaded_imgs[result[0]] = result[1]
 
         # 10. 下载 CSS/JS 到共享目录
+        # 正则匹配 .css/.js（含 ?query 后缀），排除 data: URI
         css_js_urls = set()
-        for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:css|js))', html, re.IGNORECASE):
+        for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:css|js)(?:\?[^"\']*)?)', html, re.IGNORECASE):
             css_js_urls.add(m.group(1))
 
         css_js_urls = {u for u in css_js_urls if u and not u.startswith("data:")}
@@ -2260,7 +2267,35 @@ class SyaApp:
                     if resp.status_code == 200 and len(resp.content) > 0:
                         with open(res_local_path, "wb") as f:
                             f.write(resp.content)
-                downloaded_res[res_url] = res_filename
+                # 无论本次下载是否成功，只要文件已存在就加入改写映射
+                if os.path.exists(res_local_path):
+                    downloaded_res[res_url] = res_filename
+            except Exception:
+                pass
+
+        # 额外：扫描 _res 目录，对 HTML 中引用但下载失败（文件名存在于 _res）的资源也做改写
+        # 这能修复旧帖子重新爬取时因网络问题漏改写的情况
+        try:
+            existing_res_files = set(os.listdir(self._OFFLINE_RES))
+        except Exception:
+            existing_res_files = set()
+        for res_url in list(css_js_urls):
+            if res_url in downloaded_res:
+                continue
+            # 从URL中提取文件名（去掉query string）
+            try:
+                if res_url.startswith("//"):
+                    full_url = "https:" + res_url
+                elif res_url.startswith("/"):
+                    full_url = "https://" + base + res_url
+                elif res_url.startswith("http"):
+                    full_url = res_url
+                else:
+                    full_url = "https://" + base + "/" + res_url
+                parsed = urlparse(full_url)
+                fname = os.path.basename(parsed.path)
+                if fname and fname in existing_res_files:
+                    downloaded_res[res_url] = fname
             except Exception:
                 pass
 
@@ -2292,12 +2327,11 @@ class SyaApp:
             flags=re.IGNORECASE,
         )
 
-        # CSS/JS 改相对路径 → ../../_res/filename
-        # 计算从帖子目录到 _res 的相对路径
-        # 帖子目录: output/离线网页/{section}/{date}/{page_name}/
+        # CSS/JS 改相对路径 → ../../../_res/filename
+        # 帖子目录: output/离线网页/{section}/{date}/{page_name}/index.html
         # _res 目录: output/离线网页/_res/
-        # 相对路径: ../../_res/
-        res_rel_prefix = "../../_res/"
+        # 相对路径: ../../../_res/（3层 ../）
+        res_rel_prefix = "../../../_res/"
         for orig_url, local_name in downloaded_res.items():
             escaped_url = re.escape(orig_url)
             rewritten_html = re.sub(
@@ -2700,22 +2734,55 @@ class SyaApp:
         # 按日期降序排列
         posts.sort(key=lambda p: p["date"], reverse=True)
 
-        # 生成 HTML
-        cards_html = []
+        # 按日期分组
+        from collections import OrderedDict
+        date_groups = OrderedDict()
         for p in posts:
-            tags_html = ""
-            if p["tags"]:
-                tags_html = " ".join('<span class="tag">{}</span>'.format(t) for t in p["tags"])
-            cards_html.append(
-                '<div class="post-card">'
-                '<span class="tags">{}</span>'
-                '<a href="{}" class="title">{}</a>'
-                '<span class="stats">浏览:{} 回复:{} 热度:{}</span>'
+            d = p["date"]
+            if d not in date_groups:
+                date_groups[d] = []
+            date_groups[d].append(p)
+
+        # 生成按日期分组的 HTML
+        groups_html = []
+        for date_str, group_posts in date_groups.items():
+            cards_html = []
+            for p in group_posts:
+                tags_html = ""
+                if p["tags"]:
+                    tags_html = " ".join('<span class="tag">{}</span>'.format(t) for t in p["tags"])
+                cards_html.append(
+                    '<div class="post-card">'
+                    '<span class="tags">{}</span>'
+                    '<a href="{}" class="title">{}</a>'
+                    '<span class="stats">浏览:{} 回复:{} 热度:{}</span>'
+                    '</div>'.format(
+                        tags_html,
+                        p["rel_path"],
+                        p["title"][:80] if p["title"] else p["name"],
+                        p["view"], p["reply"], p["hot"],
+                    )
+                )
+            # 默认展开第一个日期组，其余折叠
+            is_first = len(groups_html) == 0
+            checked = "checked" if is_first else ""
+            groups_html.append(
+                '<div class="date-group">'
+                '<input type="checkbox" id="d_{idx}" class="date-toggle" {checked}>'
+                '<label for="d_{idx}" class="date-header">'
+                '<span class="date-arrow">▶</span>'
+                '<span class="date-text">{date}</span>'
+                '<span class="date-count">({count})</span>'
+                '</label>'
+                '<div class="date-content">'
+                '{cards}'
+                '</div>'
                 '</div>'.format(
-                    tags_html,
-                    p["rel_path"],
-                    p["title"][:80] if p["title"] else p["name"],
-                    p["view"], p["reply"], p["hot"],
+                    idx=len(groups_html),
+                    checked=checked,
+                    date=date_str,
+                    count=len(group_posts),
+                    cards="\n".join(cards_html),
                 )
             )
 
@@ -2730,25 +2797,45 @@ body {{ font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; ba
 h1 {{ color: #333; border-bottom: 2px solid #3366CC; padding-bottom: 10px; }}
 .back-link {{ margin-bottom: 16px; }}
 .back-link a {{ color: #3366CC; text-decoration: none; }}
-.post-card {{ display: flex; align-items: center; background: #fff; margin: 6px 0; padding: 10px 16px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.count {{ color: #888; margin-bottom: 16px; }}
+
+/* 日期折叠组 */
+.date-group {{ margin-bottom: 8px; }}
+.date-toggle {{ display: none; }}
+.date-header {{
+    display: flex; align-items: center; cursor: pointer;
+    background: #e8e8e8; padding: 8px 14px; border-radius: 4px;
+    font-size: 15px; font-weight: bold; color: #333;
+    user-select: none; transition: background 0.15s;
+}}
+.date-header:hover {{ background: #d0d0e8; }}
+.date-arrow {{ display: inline-block; width: 16px; transition: transform 0.2s; font-size: 12px; color: #666; }}
+.date-text {{ margin-right: 8px; }}
+.date-count {{ color: #888; font-weight: normal; font-size: 13px; }}
+.date-content {{ display: none; padding: 4px 0 4px 16px; }}
+.date-toggle:checked + .date-header .date-arrow {{ transform: rotate(90deg); }}
+.date-toggle:checked + .date-header {{ background: #d0d0e8; }}
+.date-toggle:checked ~ .date-content {{ display: block; }}
+
+.post-card {{ display: flex; align-items: center; background: #fff; margin: 4px 0; padding: 8px 14px; border-radius: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }}
 .post-card .tags {{ flex-shrink: 0; margin-right: 10px; }}
 .post-card .tag {{ display: inline-block; background: #e8f0fe; color: #3366CC; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin-right: 3px; }}
 .post-card .title {{ flex: 1; color: #333; text-decoration: none; font-size: 14px; }}
 .post-card .title:hover {{ color: #3366CC; }}
 .post-card .stats {{ flex-shrink: 0; color: #888; font-size: 12px; margin-left: 10px; }}
-.count {{ color: #888; margin-bottom: 12px; }}
 </style>
 </head>
 <body>
 <div class="back-link"><a href="../index.html">← 返回主页</a></div>
 <h1>{section_name}</h1>
-<div class="count">共 {count} 个帖子</div>
-{cards}
+<div class="count">共 {count} 个帖子，{dates} 个日期</div>
+{groups}
 </body>
 </html>""".format(
             section_name=section_name,
             count=len(posts),
-            cards="\n".join(cards_html) if cards_html else "<p>暂无帖子</p>",
+            dates=len(date_groups),
+            groups="\n".join(groups_html) if groups_html else "<p>暂无帖子</p>",
         )
 
         section_index_path = os.path.join(section_path, "index.html")
