@@ -433,15 +433,77 @@ def judge_current_film_is_exist(designation):
     return record
 
 
+def extract_fanhao_candidates(filename):
+    """从文件名/标题中提取候选番号列表。
+
+    比原始正则 r"[0-9a-zA-Z]+-[0-9a-zA-Z]+" 更强：
+    - 先去掉常见水印前缀（489155.com@ 等）
+    - 去掉 -C / -UC / -C1 / -C2 等后缀干扰
+    - 容忍番号中的空格（如 "MEYD- 893" → "MEYD-893"）
+    - 容忍 FC2PPV-xxxxxxx 格式（FC2PPV 后跟数字，中间可能有也可能没有连字符）
+
+    返回去重后的候选列表，按出现顺序。
+    """
+    name = filename
+    # 去掉扩展名
+    name = re.sub(r'\.\w{2,4}$', '', name)
+    # 去掉水印前缀
+    name = re.sub(r'^[\w.-]+\.(com|net|org)@', '', name, flags=re.IGNORECASE)
+
+    candidates = []
+    seen = set()
+
+    # 策略1：FC2-PPV / FC2PPV 格式（优先匹配，避免被策略2拆碎）
+    # 如 FC2-PPV-4694056, FC2PPV-2800788, FC2PPV2800788
+    for m in re.finditer(r'FC2[-]?PPV[-]?(\d{5,8})', name, re.IGNORECASE):
+        cand1 = 'FC2-PPV-{}'.format(m.group(1))
+        cand2 = 'FC2PPV-{}'.format(m.group(1))
+        for c in (cand1, cand2):
+            if c not in seen:
+                seen.add(c)
+                candidates.append(c)
+
+    # 策略2：标准日文番号格式（容忍空格）
+    # 如 ABP-171, MEYD- 893, SSIS-062
+    # 排除已被 FC2 策略匹配的部分（PPV-xxx 不单独匹配）
+    for m in re.finditer(r'([A-Za-z]{2,8})\s*-\s*(\d{2,8})', name):
+        prefix = m.group(1).upper()
+        if prefix in ('PPV', 'FC2'):
+            continue  # 已由策略1处理
+        cand = '{}-{}'.format(prefix, m.group(2))
+        if cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    # 策略3：数字开头+字母+连字符+数字（如 300mium-699, 116shh-024, 553aplt-003）
+    for m in re.finditer(r'(\d{2,4}[A-Za-z]{2,5})\s*-\s*(\d{2,5})', name):
+        cand = '{}-{}'.format(m.group(1), m.group(2))
+        if cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    # 策略5：原始正则兜底（确保不漏）
+    for m in re.finditer(r'[0-9a-zA-Z]+-[0-9a-zA-Z]+', name):
+        cand = m.group(0)
+        # 去掉 -C / -UC 后缀
+        cand = re.sub(r'-(?:UC|C\d?)$', '', cand)
+        if cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    return candidates
+
+
 def is_western_designation(designation):
     """判断番号是否为欧美片。返回 True 表示应跳过，False 表示保留。
-    
+
     识别逻辑（严格避免误判日文片）：
+    0. 去掉水印前缀（489155.com@ 等）
     1. 日文番号格式 XX-NNN（如 ABP-171, MIAA-006）→ 绝不是欧美
-    2. 小写字母+点分隔+日期（如 deeper.21.12.30）→ 欧美
-    3. 小写字母4+开头+点（如 analonly.xxx, bangbus.xxx）→ 欧美
+    2. 字母+点分隔+日期（如 deeper.21.12.30, Beauty4k.25.08.03）→ 欧美
+    3. 字母2+开头+点（如 dm.xxx, nb.xxx, gdp.xxx）→ 欧美（需配合已知短前缀）
     4. 纯数字5位+番号 → 欧美
-    5. 已知欧美厂牌前缀 → 欧美
+    5. 已知欧美厂牌前缀（含 xxx4k 系列）→ 欧美
     6. 英文句子标题（3+大写开头单词连排，无中日文字符）→ 欧美
     7. 欧美题材关键词（stepmom/daddy4k等，仅对非日文格式标题）→ 欧美
     """
@@ -450,6 +512,13 @@ def is_western_designation(designation):
     des = designation.strip()
     des_lower = des.lower()
 
+    # 0. 去掉常见水印前缀，避免干扰匹配
+    #    如 "489155.com@tushy.16.06.30..." → "tushy.16.06.30..."
+    m = re.match(r'^[\w.-]+\.(com|net|org)@', des_lower)
+    if m:
+        des = des[m.end():]
+        des_lower = des_lower[m.end():]
+
     # 1. 日文番号格式：2-6个大写字母 + 连字符 + 2-6位数字
     #    如 ABP-171, MIAA-006, SSIS-062, FC2-PPV-1234567
     #    这是铁证，匹配此格式的一律不是欧美
@@ -457,14 +526,26 @@ def is_western_designation(designation):
         return False
     if re.match(r'^FC2', des, re.IGNORECASE):
         return False
+    # 300mium-699 这种数字开头+字母+数字的日文番号
+    if re.match(r'^\d{3,}[a-z]{2,}-\d', des_lower):
+        return False
 
-    # 2. 小写字母+点分隔+日期格式：brand.YY.MM.DD.name
-    if re.match(r'^[a-z]{3,}\.\d{2}\.\d{2}', des_lower):
+    # 2. 字母+点分隔+日期格式：brand.YY.MM.DD.name（不区分大小写）
+    #    如 deeper.21.12.30, Beauty4k.25.08.03, tushy.16.06.30
+    if re.match(r'^[A-Za-z]{2,}\.\d{2}\.\d{2}', des):
         return True
 
-    # 3. 小写字母4+开头+点（欧美厂牌.系列格式）
-    #    至少4个字母避免匹配到 b.xxx 这种短前缀
-    if re.match(r'^[a-z]{4,}\.', des_lower):
+    # 3. 已知短前缀+点（1-3字母的欧美厂牌缩写）
+    #    如 b.15.10.08(babes), dm.19.03.19(digitalplayground), nb.16.09.19,
+    #    gdp.e242(girlsdoporn), pc.20.10.12, jp.18.07.09
+    short_prefixes = ['b.', 'dm.', 'nb.', 'gdp.', 'pc.', 'jp.']
+    for sp in short_prefixes:
+        if des_lower.startswith(sp):
+            return True
+
+    # 3b. 字母4+开头+点（欧美厂牌.系列格式，不区分大小写）
+    #    如 analonly.xxx, bangbus.xxx, Beauty4k.xxx, Hunt4k.xxx
+    if re.match(r'^[A-Za-z]{4,}\.', des):
         return True
 
     # 4. 纯数字番号5位以上
@@ -477,6 +558,8 @@ def is_western_designation(designation):
         'brazzers', 'bangbros', 'realitykings', 'naughtyamerica', 'mofos',
         'deeper', 'vixen', 'tushy', 'blacked', 'blackedraw', 'tushyraw',
         'evilangel', 'wicked', 'sweetheart', 'girlsway', 'adulttime',
+        'sinfulxxx', 'dorcelclub', 'newsensations', 'legallporno',
+        'privatemedia', 'private.', 'roccosiffredi',
         # 系列/子品牌
         'bangbrosclips', 'bangbus', 'bbcpie', 'babes',
         'allanal', 'analvids', 'analmom', 'analonly',
@@ -490,6 +573,13 @@ def is_western_designation(designation):
         'clubseventeen', 'julesjordan', 'teamskeet',
         'helplessteens', 'hussie', 'hussiemit', 'aziani',
         'castingcouch-x', 'backroomcastingcouch', 'netgirl', 'netvideo',
+        'immorallive', 'brattymilf', 'toughlovex',
+        'familystrokes', 'doctoradventures', 'pure18',
+        'gloryhole', 'nfbusty', 'therealworkout', 'bellesaplus',
+        # xxx4k 系列（欧美厂牌常见命名）
+        'beauty4k', 'black4k', 'bride4k', 'cuck4k', 'debt4k',
+        'facials4k', 'hunt4k', 'loan4k', 'mature4k', 'pie4k',
+        'rim4k', 'swap4k', 'tutor4k',
         # 品牌-前缀匹配（如 blacked-xxx, vixen-xxx）
         'blacked-', 'blackedraw-', 'tushy-', 'tushyraw-', 'vixen-',
         'deeper-', 'bangbros-', 'bangbus-',
@@ -498,10 +588,27 @@ def is_western_designation(designation):
         if des_lower.startswith(brand):
             return True
 
-    # 6. 英文句子标题：3+个首字母大写单词连排，无中日文字符
-    #    如 "Ava Nicks - Mommy Is Such A Whore"
+    # 6. 英文句子标题：无中日文字符 + 全英文标题特征
+    #    6a. 3+个首字母大写单词连排（如 "Ava Nicks - Mommy Is Such A Whore"）
     if re.match(r'^[A-Z][a-z]+(\s+[A-Z][a-z]+){2,}', des):
         if not re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', des):
+            return True
+
+    #    6b. "名字 - 英文标题" 格式：含 " - " 分隔，无中日文字符，3+ 大写词
+    #        如 "Ava Sinclaire - The Good Student", "Marc Dorcel - Mariska, Desires..."
+    if ' - ' in des and not re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', des):
+        cap_words = re.findall(r'[A-Z][a-z]+', des)
+        if len(cap_words) >= 3:
+            return True
+
+    #    6c. 已知欧美系列名开头（含 " - " 分隔的标题）
+    #        如 "NaughtyOffice - ...", "FakeDrivingSchool - ...", "Marc Dorcel - ..."
+    western_series = [
+        'naughtyoffice', 'fakedrivingschool', 'marc dorcel', 'meana wolf',
+        'defloration', 'emily willis',
+    ]
+    for ws in western_series:
+        if des_lower.startswith(ws):
             return True
 
     # 7. 欧美题材关键词（保守选择，仅日文标题中极不可能出现的词）
@@ -681,9 +788,32 @@ def _get_cooldown_seconds():
     return extra
 
 
+def _is_safe_page_html(html):
+    """检测HTML是否为论坛反爬safe验证页（模块级工具函数）"""
+    if not html:
+        return False
+    if "static/safe/js/" in html and "safeid" in html:
+        return True
+    if "mainv2.js" in html and len(html) < 2000:
+        return True
+    return False
+
+
 def get_url_txt(url_inp, cookie):
-    return _http_session.get(url_inp, allow_redirects=True,
-                              headers=HEADERS, cookies=cookie).text
+    """请求页面并返回HTML文本。
+    
+    内置safe页自动重试：如果第一次拿到safe验证页，等待1秒后重试，
+    最多重试2次。safe页是论坛JS反爬机制，有时重试就能拿到正常页面。
+    """
+    for attempt in range(3):
+        html = _http_session.get(url_inp, allow_redirects=True,
+                                  headers=HEADERS, cookies=cookie).text
+        if not _is_safe_page_html(html):
+            return html
+        # 拿到safe页，等待后重试
+        if attempt < 2:
+            time.sleep(1 + attempt)  # 1秒、2秒
+    return html  # 3次都是safe页，返回safe页让调用方处理
 
 
 def get_url_txt_without_cookie(url_inp):
@@ -790,6 +920,21 @@ def get_url_txt_streaming(url_inp, timeout=120, progress_callback=None):
 #  主 GUI 类
 # ============================================================
 
+# ============================================================
+#  页面类型常量（用于 _classify_page_type 精确分类）
+# ============================================================
+# 正常帖子页面：包含帖子内容区域（postlist、磁力链接等）
+PAGE_NORMAL = "normal"
+# 需要登录的帖子：权限不足，需要登录后才能访问（跳过，不计入Cookie失效）
+PAGE_LOGIN_REQUIRED = "login_required"
+# 帖子已删除/不存在/审核中（跳过，不计入Cookie失效）
+PAGE_DELETED = "deleted"
+# safe反爬验证页：这是真正的Cookie失效信号！（应停止爬取并提示更新Cookie）
+PAGE_SAFE_BLOCK = "safe_block"
+# 页面过短且无法判断类型（跳过，不计入Cookie失效）
+PAGE_UNKNOWN_SHORT = "unknown_short"
+
+
 class SyaApp:
     def __init__(self):
         # 初始化 SQLite 数据库（自动建表）
@@ -851,6 +996,20 @@ class SyaApp:
         self._cookie_invalid_lock = threading.Lock()
         self._cookie_invalid_threshold = 3  # 连续3次登录页则判定失效
 
+        # Cookie失效交叉验证：利用多线程并发信息避免误判
+        # 当多个线程并发爬取时，个别线程遇到坏帖子(404/删帖/权限不足)可能被
+        # _is_login_page() 误判为登录页。如果最近有其他线程成功处理帖子，
+        # 说明Cookie仍然有效，不应判定为失效。
+        self._last_success_time_lock = threading.Lock()
+        self._last_success_time = 0  # 最近一次任意线程成功处理帖子的时间戳
+        self._cookie_invalid_window = 10  # 时间窗口（秒）：窗口内有成功则不判定Cookie失效
+
+        # safe页（反爬JS验证）连续计数 — 与Cookie失效分开统计
+        # safe页是临时拦截，不应判定Cookie失效终止爬取
+        self._safe_page_count = 0
+        self._safe_page_lock = threading.Lock()
+        self._safe_page_threshold = 15  # 连续15次safe页才认为被严重限流
+
         # 爬取进度追踪（线程安全）
         self._crawl_processed = 0  # 已处理帖子数
         self._crawl_total = 0  # 总帖子数
@@ -859,7 +1018,8 @@ class SyaApp:
         # 离线爬取专用
         self._offline_dl_lock = threading.Lock()  # 离线爬取线程安全锁
         self._crawl_verify_post_id = None  # Cookie二次验证用帖号
-        self._last_success_time = 0  # 最近成功请求时间（60秒内跳过二次验证）
+        # _last_success_time 和 _last_success_time_lock 已在上方Cookie失效交叉验证区域定义（L988-990）
+        # 离线爬取也复用此变量：60秒内跳过二次验证
         self._crawl_stop_reason = ""  # 爬取终止原因
 
         # 黑名单/白名单缓存（避免每次查询都开DB连接）
@@ -1280,6 +1440,12 @@ class SyaApp:
 
     def _crawl_worker(self, begin, end, thread_num):
         total = end - begin
+        # 重置爬取状态
+        self._crawl_stop_reason = ""
+        with self._cookie_invalid_lock:
+            self._cookie_invalid_count = 0
+        with self._safe_page_lock:
+            self._safe_page_count = 0
         self._log("开始爬取：{} - {}，共 {} 个帖子，线程数：{}".format(begin, end, total, thread_num))
         try:
             cookie = parse_cookie_file(self.cookie_path.get())
@@ -1289,16 +1455,20 @@ class SyaApp:
             self.root.after(0, self._crawl_done)
             return
 
-        # 爬取前验证 Cookie 是否有效：访问一个帖子，检查是否被重定向到登录页
+        # 爬取前验证 Cookie 是否有效：访问一个帖子，检查页面类型
         self._log("正在验证 Cookie 有效性...")
         try:
             test_url = "https://{}/thread-{}-1-1.html".format(self.base_url.get().strip().rstrip("/"), begin)
             test_html = get_url_txt(test_url, cookie)
-            if self._is_login_page(test_html):
-                self._log("[Cookie无效] 测试页面返回登录页，Cookie已失效！请更新Cookie后重试")
-                self._log("[Cookie无效] 终止爬取，未处理任何帖子")
+            test_type = self._classify_page_type(test_html)
+            if test_type == PAGE_SAFE_BLOCK:
+                self._log("[Cookie警告] 测试页面返回safe验证页（Cookie失效），请更新Cookie后重试")
+                self._log("[Cookie警告] 终止爬取，未处理任何帖子")
                 self.root.after(0, self._crawl_done)
                 return
+            elif test_type in (PAGE_LOGIN_REQUIRED, PAGE_DELETED):
+                self._log("[Cookie警告] 测试页面返回{}，爬取将继续".format(
+                    "需要登录" if test_type == PAGE_LOGIN_REQUIRED else "帖子已删除"))
             self._log("Cookie 验证通过")
         except Exception as e:
             self._log("[Cookie验证] 请求失败：{}，将继续尝试爬取".format(e))
@@ -1385,6 +1555,109 @@ class SyaApp:
         return val
 
     @staticmethod
+    def _clean_performer_overflow(performer: str) -> str:
+        """清洗 performer 字段的 HTML 溢出污染。
+
+        防御措施：
+        1. 长度截断: performer 合理上限约 30 字符（日本演员名 2-6 字符，
+           多演员空格分隔一般不超过 30），超过时截断到第一个异常边界。
+        2. HTML 属性残留检测: 以 " /> 、"/>、/> 等结尾说明有 HTML 溢出，回溯截断。
+        3. 字段溢出检测: 包含其他已知字段标记（【影片容、【是否有码、
+           【种子期限 等）或 [无码破解] 等标签，说明跨字段吞噬，只保留首段有效片段。
+        4. 方括号溢出处理: 【后面跟的不是合法艺名格式（不以 】包裹的完整标签），
+           而是其他字段内容时截断。
+
+        Args:
+            performer: 原始 performer 字符串（可能已被基础清洗过）
+
+        Returns:
+            清洗后的 performer 字符串
+        """
+        if not performer:
+            return performer
+
+        original = performer
+
+        # ── 1. 长度合理性检查与截断 ──
+        MAX_REASONABLE_LEN = 30
+        if len(performer) <= MAX_REASONABLE_LEN:
+            # 短字符串直接返回，无需溢出清洗
+            return performer
+
+        # ── 2. HTML 属性残留检测与截断 ──
+        # 匹配尾部 " />、' />、"/>、'/>、/>、> 等闭合标记
+        html_tail_patterns = [
+            r'\s*"\s*/>\s*$',   # " />
+            r"'\s*/>\s*$",     # ' />
+            r'"\s*/>\s*$',     # " />
+            r'"/>\s*$',        # "/>
+            r'/?>\s*$',        # > 或 />
+        ]
+        for pat in html_tail_patterns:
+            m = re.search(pat, performer)
+            if m:
+                # 从残留位置往回找，截断到残留之前
+                performer = performer[:m.start()].strip()
+                break
+
+        if len(performer) <= MAX_REASONABLE_LEN:
+            return performer.strip()
+
+        # ── 3. 字段溢出检测：识别已知后续字段标记并截断 ──
+        # 这些标记表明 performer 吞噬了后续字段的文本内容
+        overflow_markers = [
+            r'【影片容',       # 【影片容量
+            r'【是否有码',
+            r'【种子期限',
+            r'【热度',
+            r'\[无码破解\]',   # [无码破解]
+            r'\[有码破解\]',
+            r'\[中文字幕\]',
+            r'98堂',          # 站点名称常出现在 description 溢出中
+            r'堂\[原色',      # 如 98堂[原色花堂]
+            r'人生勝ち組',     # SNOS-227 样例中的溢出文本特征
+        ]
+
+        for marker in overflow_markers:
+            m = re.search(marker, performer)
+            if m:
+                # 截断到标记出现的位置
+                performer = performer[:m.start()].strip()
+                break
+
+        if len(performer) <= MAX_REASONABLE_LEN:
+            return performer.strip()
+
+        # ── 4. 方括号/全角括号溢出处理 ──
+        # 如果遇到 【 且后面没有对应的 】形成合法艺名格式，则在此截断
+        # 合法艺名格式示例：【藤村兰&ネオペイ】（以】闭合）
+        bracket_pos = performer.find('【')
+        if bracket_pos > 0:
+            # 检查 【之后是否有配对的 】
+            after_bracket = performer[bracket_pos + 1:]
+            if '】' not in after_bracket or after_bracket.index('】') > 20:
+                # 没有 】 或 】距离太远，不是合法艺名，截断
+                performer = performer[:bracket_pos].strip()
+
+        if len(performer) <= MAX_REASONABLE_LEN:
+            return performer.strip()
+
+        # ── 5. 最终兜底：超过长度限制 ──
+        # 优先尝试在词边界（空格）处截断，保留尽可能多的完整演员名；
+        # 如果无法在空格处截断（纯超长无空格），则硬截断到合理长度。
+        if len(performer) > MAX_REASONABLE_LEN:
+            # 查找 MAX_REASONABLE_LEN 之前的最后一个空格，在此处截断
+            truncate_at = performer.rfind(" ", 0, MAX_REASONABLE_LEN + 1)
+            if truncate_at > 0:
+                # 在空格处截断，保留完整的演员名片段
+                performer = performer[:truncate_at].strip()
+            else:
+                # 无空格可利用，硬截断
+                performer = performer[:MAX_REASONABLE_LEN].strip()
+
+        return performer
+
+    @staticmethod
     def _extract_field(html, field_name, default="unknown"):
         """从HTML中提取【字段名】：值，四策略逐级降级。"""
         candidates = []
@@ -1440,7 +1713,11 @@ class SyaApp:
 
         for post_id in range(begin, end):
             if not self.crawl_running:
-                self._log("[{}] 爬取被用户中断".format(thread_id))
+                reason = getattr(self, '_crawl_stop_reason', '')
+                if reason == "cookie_invalid":
+                    self._log("[{}] Cookie失效，停止爬取".format(thread_id))
+                else:
+                    self._log("[{}] 爬取被用户中断".format(thread_id))
                 return
 
             processed += 1
@@ -1463,32 +1740,47 @@ class SyaApp:
                 self.crawl_stats["fail"] += 1
                 continue
 
-            # 检查页面是否有效（太短说明被拦截或404）
-            if len(html) < 500:
-                # 先检查是否是登录页（Cookie失效）
-                if self._is_login_page(html):
-                    self._report_cookie_invalid(thread_id, next_url)
-                    if not self.crawl_running:
-                        self._log("[{}] Cookie已失效，终止爬取 | 已处理 {} 个帖子".format(thread_id, processed))
-                        return
-                else:
-                    self._log("[{}] [FAIL] 页面无效 | {} | 仅{}字节，可能404或被拦截".format(thread_id, next_url, len(html)))
-                self.crawl_stats["other"] += 1
-                continue
+            # 检查页面是否有效（使用精确分类器区分不同异常类型）
+            # 核心原则：只有 safe 反爬验证页才算真正的 Cookie 失效需要停止！
+            # 登录页/删帖/短页面全部跳过，不计入 Cookie 失效计数。
+            page_type = self._classify_page_type(html)
 
-            # 检查是否被重定向到登录页（页面较长但内容是登录）
-            if self._is_login_page(html):
-                self._report_cookie_invalid(thread_id, next_url)
-                self.crawl_stats["other"] += 1
+            if page_type == PAGE_SAFE_BLOCK:
+                # 🛑 真正的 Cookie 失效！safe反爬验证页 → 停止爬取
+                self._report_cookie_invalid(thread_id, next_url, reason="safe_page")
                 if not self.crawl_running:
                     self._log("[{}] Cookie已失效，终止爬取 | 已处理 {} 个帖子".format(thread_id, processed))
                     return
+                self.crawl_stats["other"] += 1
                 continue
 
+            if page_type in (PAGE_LOGIN_REQUIRED, PAGE_DELETED, PAGE_UNKNOWN_SHORT):
+                # ⏭️ 登录页/删帖/短页面 → 全部跳过，不计入Cookie失效计数！
+                type_text = {
+                    PAGE_LOGIN_REQUIRED: "需要登录",
+                    PAGE_DELETED: "帖子已删除",
+                    PAGE_UNKNOWN_SHORT: "页面过短",
+                }[page_type]
+                self._log("[{}] [SKIP] {}（{}字节）| {} | {}".format(
+                    thread_id, type_text, len(html), next_url,
+                    "仅{}字节".format(len(html)) if page_type == PAGE_UNKNOWN_SHORT else ""))
+                self.crawl_stats["other"] += 1
+                continue
+
+            # 到这里说明是 PAGE_NORMAL 或其他可处理的页面 → 继续原有逻辑
+
             # 2. 提取磁力链接
-            # 页面有效（到达此步说明非登录页），重置Cookie失效计数
+            # 页面有效（到达此步说明通过 _classify_page_type 检查，非异常页面），重置Cookie失效计数和safe页计数
             with self._cookie_invalid_lock:
                 self._cookie_invalid_count = 0
+            with self._safe_page_lock:
+                self._safe_page_count = 0
+
+            # 【交叉验证】更新最近成功时间戳（证明Cookie有效）
+            # 位置：确认页面有效且通过 _classify_page_type 检查之后、提取到磁力链接之前
+            # 此时已通过 _classify_page_type 检查，说明Cookie能有效访问论坛
+            with self._last_success_time_lock:
+                self._last_success_time = time.time()
 
             mag = re.findall(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+", str(html))
             if not mag:
@@ -1579,6 +1871,8 @@ class SyaApp:
                     performer = performer.rstrip(".;。、,，/\\")
                     # 合并多余空格
                     performer = re.sub(r"\s+", " ", performer).strip()
+                    # ★ 溢出污染防御：检测并截断超长 / HTML 溢出 / 跨字段吞噬的 performer
+                    performer = self._clean_performer_overflow(performer)
 
             # 7. 大小
             size = self._extract_field(html, "影片容量", "unknown")
@@ -1608,6 +1902,14 @@ class SyaApp:
             self._log("[{}] [INFO] 番号={} | 类型={} | 演员={} | 影片={} | 大小={} | 码={} | 热度={} | 查看/回复={}/{} | 磁力={}".format(
                 thread_id, fanhao, cn_type, performer, film_name[:30], size, mosaic, hot_num, view, reply, mag[0]))
 
+            # 10.5 跳过欧美片（根据番号格式自动识别）
+            # 放在写磁力文件之前，避免欧美片磁力写入文件
+            if is_western_designation(designation) or is_western_designation(title):
+                self._log("[欧美] [SKIP] 跳过欧美片 | {} | 番号: {}".format(next_url, designation))
+                self.crawl_stats.setdefault("western_skip", 0)
+                self.crawl_stats["western_skip"] += 1
+                continue
+
             # 11. 写磁力文件
             try:
                 day_name = time.strftime("%Y-%m-%d")
@@ -1622,13 +1924,6 @@ class SyaApp:
                         self._log("[无码] [SKIP] 跳过磁力写入 | {} | 番号: {}".format(next_url, fanhao))
             except Exception as e:
                 self._log("[磁力] 写入磁力文件失败 | {} | 错误: {}".format(next_url, e))
-
-            # 11.5 跳过欧美片（根据番号格式自动识别）
-            if is_western_designation(designation):
-                self._log("[欧美] [SKIP] 跳过欧美片 | {} | 番号: {}".format(next_url, designation))
-                self.crawl_stats.setdefault("western_skip", 0)
-                self.crawl_stats["western_skip"] += 1
-                continue
 
             # 12. 判断已存在（按 designation 查重，同番号只保留一条）
             existing = judge_current_film_is_exist(designation)
@@ -1710,51 +2005,156 @@ class SyaApp:
 
         self._log("[{}] 完成，处理了 {} 个帖子".format(thread_id, processed))
 
-    def _is_login_page(self, html):
-        """检测页面是否为登录页 / Cookie失效提示页"""
+    def _classify_page_type(self, html):
+        """精确分类页面类型，返回 PAGE_xxx 常量
+
+        核心原则：只有 safe 反爬验证页才算真正的 Cookie 失效需要停止！
+        其他异常页面（登录页、删帖、短页面）全部跳过即可。
+
+        返回值:
+            PAGE_NORMAL          - 正常帖子页面
+            PAGE_LOGIN_REQUIRED  - 需要登录的帖子（权限不足）
+            PAGE_DELETED        - 删帖/不存在/审核中
+            PAGE_SAFE_BLOCK     - safe反爬验证 = 真正的Cookie失效（🛑停止爬取）
+            PAGE_UNKNOWN_SHORT   - 过短无法判断
+        """
         if not html:
-            return True
-        # 正常帖子页面特征：有帖子内容区域，优先判断
+            return PAGE_UNKNOWN_SHORT
+
+        # ✅ 正常帖子特征 → 直接返回正常
+        # 包含 Discuz 帖子列表区域或帖子内容区域
         if "postlist" in html or 'id="post_' in html or "ajaxdialog" in html:
-            return False
-        # 没有帖子内容 → 检查是否包含 Cookie 失效 / 登录页特征
-        # （不限制页面长度：论坛"提示信息"页通常 8000+ 字节但同样是 Cookie 失效页）
-        login_signs = [
-            "member.php?mod=logging",
-            "action=login",
-            "请先登录",
-            "您需要登录",
-            "loginform",
-            "type=login",
+            return PAGE_NORMAL
+        # 包含磁力链接格式 → 正常帖子内容
+        if "magnet:?xt=urn:btih:" in html:
+            return PAGE_NORMAL
+
+        # 🛑 safe验证页 → 这是真正的Cookie失效！（~861字节，随机人名title，含 safeid + mainv2.js）
+        if self._is_safe_page(html):
+            return PAGE_SAFE_BLOCK
+
+        # ⚠️ 删帖/不存在提示 → 跳过即可（必须在 id="ct" 检查之前！
+        #   因为 Discuz 的删帖/权限提示页也包含 id="ct" 和 viewthread）
+        delete_signs = [
+            "指定的主题不存在",
+            "已被删除",
+            "正在被审核",
+            "不存在或已被删除",
         ]
-        for sign in login_signs:
+        for sign in delete_signs:
             if sign in html:
-                return True
-        # Discuz "提示信息" 页面特征：<title>提示信息</title>
-        # Cookie 失效时论坛返回的提示页，内容包含"您需要登录"等文字
-        title = ""
+                return PAGE_DELETED
+
+        # 包含 Discuz 典型帖子 DOM 结构（此时已排除删帖页，可安全判定为正常）
+        if 'id="ct"' in html and ("viewthread" in html or "mod=viewthread" in html):
+            return PAGE_NORMAL
+
+        # ⚠️ 需要登录的帖子 / 权限不足页面 → 跳过即可
+        title = self._extract_title(html)
+        login_signs = ["member.php?mod=logging", "请先登录", "您需要登录", "loginform"]
+        has_login_signs = any(s in html for s in login_signs)
+
+        if has_login_signs and (title == "提示信息" or title.startswith("提示信息")):
+            # 进一步区分是"删帖提示"还是"需要登录"
+            if any(s in html for s in delete_signs):
+                return PAGE_DELETED
+            return PAGE_LOGIN_REQUIRED
+
+        # 其他情况根据 title 判断
+        if title == "提示信息" or title.startswith("提示信息"):
+            # 没有明确的删帖文字，但有登录特征 → 归类为需登录
+            if has_login_signs:
+                return PAGE_LOGIN_REQUIRED
+            return PAGE_DELETED  # 默认归为删帖
+
+        # 服务器错误
+        if "502 Bad Gateway" in title or "503 Service" in title:
+            return PAGE_DELETED
+
+        # 页面过短但没匹配到任何特征
+        if len(html) < 500:
+            return PAGE_UNKNOWN_SHORT
+
+        return PAGE_NORMAL  # 兜底：默认当正常处理
+
+    def _extract_title(self, html):
+        """从 HTML 中提取 <title> 标签内容"""
         pos1 = html.find("<title>")
         pos2 = html.find("</title>")
         if pos1 != -1 and pos2 != -1:
-            title = html[pos1 + 7:pos2].strip()
-            if title == "提示信息" or title.startswith("提示信息"):
-                return True
-        # 502 / 503 等服务器错误页也不是正常帖子
-        if "502 Bad Gateway" in title or "503 Service" in title:
+            return html[pos1 + 7:pos2].strip()
+        return ""
+
+    def _is_login_page(self, html):
+        """兼容接口：保持向后兼容
+
+        内部调用 _classify_page_type()，将非正常页面统一视为"登录页"。
+        新代码应优先使用 _classify_page_type() 获取更精确的分类结果。
+
+        注意：PAGE_DELETED 和 PAGE_LOGIN_REQUIRED 在此接口中返回 True，
+              但调用处应使用 _classify_page_type() 来区分这两种情况，
+              避免将删帖/权限不足误判为 Cookie 失效。
+        """
+        page_type = self._classify_page_type(html)
+        # safe_block、deleted、login_required、unknown_short 都算"非正常"
+        return page_type != PAGE_NORMAL
+
+    @staticmethod
+    def _is_safe_page(html):
+        """检测是否为论坛反爬 safe 验证页（JS验证页）。
+        特征：页面短小，含 static/safe/js/ 和 safeid 变量，title为随机人名。
+        这种页面不是登录页也不是正常帖子，是反爬拦截。"""
+        if not html:
+            return False
+        # 核心特征：safe JS 验证脚本
+        if "static/safe/js/" in html and "safeid" in html:
+            return True
+        # 辅助特征：页面很短 + mainv2.js
+        if "mainv2.js" in html and len(html) < 2000:
             return True
         return False
 
-    def _report_cookie_invalid(self, thread_id, next_url):
-        """报告Cookie失效，连续达到阈值则终止所有线程"""
+    def _report_cookie_invalid(self, thread_id, next_url, reason="login_page"):
+        """报告Cookie失效，连续达到阈值则终止所有线程
+
+        reason: login_page / safe_page / short_page
+
+        【交叉验证机制】多线程并发时，个别线程遇到坏帖子(404/删帖/权限不足)
+        可能被 _is_login_page() 误判为登录页。在判定Cookie真正失效前，检查最近
+        是否有其他线程成功处理过帖子：
+        - 如果在 _cookie_invalid_window(10秒) 内有任意线程成功 → 说明Cookie有效，
+          这只是个别坏帖子，不累加计数（或仅记录警告），避免误判终止爬取
+        - 如果超过窗口期没有任何线程成功 → 可能是真的Cookie失效，按原逻辑计数
+        """
+        # 交叉验证：检查最近是否有其他线程成功处理帖子
+        need_cross_check = (reason in ("login_page", "short_page"))
+        if need_cross_check:
+            with self._last_success_time_lock:
+                last_success = self._last_success_time
+            elapsed_since_success = time.time() - last_success
+
+            if elapsed_since_success < self._cookie_invalid_window:
+                # 窗口期内有其他线程成功 → Cookie有效，这是个别坏帖子，不计入失效计数
+                self._log("[Cookie误判防护] {} | {} | 距上次成功仅{:.1f}秒，跳过Cookie失效计数".format(
+                    thread_id, next_url, elapsed_since_success))
+                return  # 不累加计数，不触发终止
+
         with self._cookie_invalid_lock:
             self._cookie_invalid_count += 1
             count = self._cookie_invalid_count
 
+        reason_text = {
+            "login_page": "遇到登录页",
+            "safe_page": "被反爬safe页拦截",
+            "short_page": "页面异常过短",
+        }.get(reason, "遇到异常页面")
+
         if count >= self._cookie_invalid_threshold:
-            self._log("[Cookie无效] 连续{}次遇到登录页，判定Cookie已失效！终止爬取".format(count))
+            self._log("[Cookie无效] 连续{}次{}，判定Cookie已失效！终止爬取".format(count, reason_text))
             self.crawl_running = False  # 通知所有线程停止
+            self._crawl_stop_reason = "cookie_invalid"
         else:
-            self._log("[Cookie可疑] 第{}次遇到登录页 | {} | 继续观察...".format(count, next_url))
+            self._log("[Cookie可疑] 第{}次{} | {} | 继续观察...".format(count, reason_text, next_url))
 
     def _update_progress(self, pct, done, total):
         """在主线程更新进度条（由 root.after 调用）"""
@@ -1817,8 +2217,15 @@ class SyaApp:
 
     @staticmethod
     def _sanitize_dirname(name):
-        """清理目录名中的非法字符，并截断到合理长度"""
-        cleaned = re.sub(r'[\\/:*?"<>|]', '', name).strip().strip('.')
+        """清理目录名中的非法字符（Windows + Unicode 特殊字符），并截断到合理长度"""
+        # Windows 非法字符: \ / : * ? " < > |
+        # Unicode 特殊字符: ❤️ ￥ ~ 等表情符号和符号（保留中文、英文、数字、常用标点）
+        cleaned = re.sub(r'[\\/:*?"<>|]', '', name)
+        # 去掉 emoji 和特殊 Unicode 符号（保留 CJK、ASCII 可打印字符、常用标点、空格）
+        # 注意: []内需要用\\s，因为raw string中\s不会被解释为转义
+        cleaned = re.sub(r'[^\w\u4e00-\u9fff\-_.()\[\]{}，。！？、；：""''《》【】\\s]', '', cleaned)
+        # 清理多余空白
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip().strip('.')
         return cleaned[:80] if len(cleaned) > 80 else cleaned
 
     @staticmethod
@@ -1899,8 +2306,9 @@ class SyaApp:
         try:
             test_url = "https://{}/thread-{}-1-1.html".format(base, begin)
             test_html = get_url_txt(test_url, cookie)
-            if self._is_login_page(test_html):
-                self._log("[离线] Cookie无效！测试页面返回登录页，请更新Cookie后重试")
+            test_type = self._classify_page_type(test_html)
+            if test_type == PAGE_SAFE_BLOCK:
+                self._log("[离线] Cookie无效！测试页面返回safe验证页，请更新Cookie后重试")
                 self._crawl_stop_reason = "cookie_invalid"
                 self.root.after(0, self._offline_crawl_done)
                 return
@@ -2044,24 +2452,13 @@ class SyaApp:
                 downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "fail", "skip_reason": "request_error"}
             return
 
-        # 2. 检查页面有效性
-        if len(html) < 500:
-            if self._is_login_page(html):
-                self._log("[离线][{}] post={} 页面为登录页，Cookie可能失效".format(thread_id, post_id))
-                with self._cookie_invalid_lock:
-                    self._cookie_invalid_count += 1
-                    if self._cookie_invalid_count >= self._cookie_invalid_threshold:
-                        self.crawl_running = False
-                        self._crawl_stop_reason = "cookie_invalid"
-            else:
-                self._log("[离线][{}] post={} 页面无效（仅{}字节）".format(thread_id, post_id, len(html)))
-            self.crawl_stats["other"] += 1
-            with self._offline_dl_lock:
-                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "page_too_short"}
-            return
+        # 2. 检查页面有效性（使用精确分类器区分不同异常类型）
+        # 核心原则：只有 safe 反爬验证页才算真正的 Cookie 失效！
+        page_type = self._classify_page_type(html)
 
-        if self._is_login_page(html):
-            self._log("[离线][{}] post={} 页面为登录页，Cookie可能失效".format(thread_id, post_id))
+        if page_type == PAGE_SAFE_BLOCK:
+            # 🛑 真正的 Cookie 失效！safe反爬验证页
+            self._log("[离线][{}] post={} Cookie失效（safe验证页）".format(thread_id, post_id))
             with self._cookie_invalid_lock:
                 self._cookie_invalid_count += 1
                 if self._cookie_invalid_count >= self._cookie_invalid_threshold:
@@ -2069,31 +2466,63 @@ class SyaApp:
                     self._crawl_stop_reason = "cookie_invalid"
             self.crawl_stats["other"] += 1
             with self._offline_dl_lock:
-                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "login_page"}
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "safe_page"}
             return
 
-        # 页面有效，重置 Cookie 失效计数
+        if page_type == PAGE_DELETED:
+            # ⏭️ 帖子已删除/不存在 → 跳过，不计入Cookie失效计数
+            self._log("[离线][{}] post={} 帖子已删除或不存在，跳过".format(thread_id, post_id))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "deleted"}
+            return
+
+        if page_type == PAGE_LOGIN_REQUIRED:
+            # ⏭️ 需要登录 → 跳过，不计入Cookie失效计数
+            self._log("[离线][{}] post={} 需要登录才能访问，跳过".format(thread_id, post_id))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "login_required"}
+            return
+
+        if page_type == PAGE_UNKNOWN_SHORT:
+            # ⏭️ 页面过短 → 跳过，不计入Cookie失效计数
+            self._log("[离线][{}] post={} 页面无效（仅{}字节）".format(thread_id, post_id, len(html)))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "page_too_short"}
+            return
+
+        # 页面有效（通过 _classify_page_type 检查），重置 Cookie 失效计数和 safe 页计数
         with self._cookie_invalid_lock:
             self._cookie_invalid_count = 0
+        with self._safe_page_lock:
+            self._safe_page_count = 0
 
         # 3. Cookie二次验证：距上次成功超过60秒则验证
         now = time.time()
-        if self._crawl_verify_post_id and now - self._last_success_time > 60:
+        with self._last_success_time_lock:
+            last_success = self._last_success_time
+        if self._crawl_verify_post_id and now - last_success > 60:
             verify_url = "https://{}/thread-{}-1-1.html".format(base, self._crawl_verify_post_id)
             try:
                 verify_html = get_url_txt(verify_url, cookie)
-                if self._is_login_page(verify_html) or len(verify_html) < 500:
-                    self._log("[离线][{}] Cookie二次验证失败！终止爬取".format(thread_id))
+                verify_type = self._classify_page_type(verify_html)
+                if verify_type == PAGE_SAFE_BLOCK:  # 只有 safe 页才算 Cookie 失效
+                    self._log("[离线][{}] Cookie二次验证失败（safe页）！终止爬取".format(thread_id))
                     self.crawl_running = False
                     self._crawl_stop_reason = "cookie_invalid"
                     with self._offline_dl_lock:
                         downloaded[pid_str] = {"name": "", "section": "", "date": "", "status": "invalid", "skip_reason": "cookie_verify_fail"}
                     return
-                self._last_success_time = time.time()
+                # 其他异常类型（deleted/login_required/unknown_short）不计入Cookie失效
+                with self._last_success_time_lock:
+                    self._last_success_time = time.time()
             except Exception:
                 pass  # 验证请求失败不终止，继续
 
-        self._last_success_time = time.time()
+        with self._last_success_time_lock:
+            self._last_success_time = time.time()
 
         # 4. 提取标题 → page_name
         pos1 = html.find("<title>")
@@ -2170,6 +2599,24 @@ class SyaApp:
                 downloaded[pid_str] = {
                     "name": page_name, "section": section_name, "date": pub_date,
                     "status": "skipped", "skip_reason": "section_not_in_whitelist",
+                }
+            return
+
+        # 7.5 欧美片过滤（在下载资源前拦截，避免浪费带宽和磁盘空间）
+        # 用标题和番号分别判断，任一命中即跳过
+        designation_for_check = fanhao
+        # 去掉 -C / -UC 后缀
+        if designation_for_check.endswith("-UC"):
+            designation_for_check = designation_for_check[:-3]
+        elif designation_for_check.endswith("-C"):
+            designation_for_check = designation_for_check[:-2]
+        if is_western_designation(designation_for_check) or is_western_designation(title):
+            self._log("[离线][{}] post={} 跳过（欧美片: {}）".format(thread_id, post_id, designation_for_check[:50]))
+            self.crawl_stats["other"] += 1
+            with self._offline_dl_lock:
+                downloaded[pid_str] = {
+                    "name": page_name, "section": section_name, "date": pub_date,
+                    "status": "skipped", "skip_reason": "western_video",
                 }
             return
 
@@ -2455,6 +2902,8 @@ class SyaApp:
                 performer = re.sub(r"[、，,\t　]", " ", performer)
                 performer = performer.rstrip(".;。、,，/\\")
                 performer = re.sub(r"\s+", " ", performer).strip()
+                # ★ 溢出污染防御：检测并截断超长 / HTML 溢出 / 跨字段吞噬的 performer
+                performer = self._clean_performer_overflow(performer)
 
         # 6. 大小
         size = self._extract_field(html, "影片容量", "unknown")
@@ -2994,7 +3443,7 @@ function doSearch() {{
             "title": meta.get("title", page_name),
             "section": section_name,
             "date": pub_date,
-            "path": "{}/{}/{}".format(
+            "path": "{}/{}".format(
                 self._sanitize_dirname(section_name), post_rel_path
             ),
             "view": meta.get("view", 0),
@@ -3929,7 +4378,7 @@ function doSearch() {{
                 continue
             if "-UC" in file:
                 continue
-            ret = re.findall(r"[0-9a-zA-Z]+-[0-9a-zA-Z]+", file)
+            ret = extract_fanhao_candidates(file)
             if not ret:
                 continue
             for temp_ret in ret:
@@ -3968,7 +4417,7 @@ function doSearch() {{
             while rec is not None:
                 true_fanhao = rec[IDX_DESIGNATION]
                 fanhao = rec[IDX_NUMBERS_NAME]
-                ret = re.findall(r"[0-9a-zA-Z]+-[0-9a-zA-Z]+", true_fanhao)
+                ret = extract_fanhao_candidates(true_fanhao)
                 if ret and ret[0] != true_fanhao:
                     self._log("[修正] {} => {}".format(true_fanhao, ret[0]))
                     link_db_cmd("UPDATE av SET designation = ? WHERE numbers_name = ?", (ret[0], fanhao), action="番号修正")
@@ -4782,7 +5231,7 @@ function doSearch() {{
             if os.path.isdir(path + file):
                 self._rename_recursive(path + file + "/", con)
                 continue
-            ret = re.findall(r"[0-9a-zA-Z]+-[0-9a-zA-Z]+", file)
+            ret = extract_fanhao_candidates(file)
             if not ret:
                 continue
             for temp_ret in ret:

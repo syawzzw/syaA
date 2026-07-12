@@ -21,12 +21,16 @@
 - 2026-06-16：Cookie二次验证仍误判 — `begin`帖号本身可能不存在(404)，二次验证请求它也被误判；新增 `_last_success_time` 机制：最近60秒内有成功请求则跳过二次验证直接判定Cookie有效
 - 2026-06-27：离线爬取分区错乱 — 论坛改版后面包屑新增 `forum.php?mod=forumdisplay&fid=XX` 格式，代码只认老格式 `forum-XX-1.html` 导致 section 误判为"其他"，非白名单帖子被错误保留；已新增新格式 fallback 正则，并清理 534 个非白名单帖子(4.1GB)
 - 2026-07-10：`_is_login_page()` 长度阈值漏洞 — 论坛"提示信息"页(Cookie失效)8376~11122字节，超过5000阈值绕过检测，导致离线爬取保存了4049个错误页；已重写：去掉长度限制，先检查postlist正常特征→没有则直接查登录特征词+title检测；同时分区默认值从"其他"改为"unknown"防止提取失败误入白名单
+- 2026-07-11：普通爬取误报"用户中断" — 论坛反爬 safe 验证页(~890字节，含`static/safe/js/`+`safeid`+随机人名title)绕过了`_is_login_page`和长度检测，被误计为"无磁力"；新增 `_is_safe_page()` 检测方法，在普通爬取和离线爬取中均加入此检测；根本原因是Cookie文件缺少`cPNj_2132_auth`/`cPNj_2132_sid`登录认证Cookie
+- 2026-07-11：**页面分类器重构** — 从`_is_login_page()`二值判定(True/False)改为五类枚举分类器(`PAGE_NORMAL/PAGE_LOGIN_REQUIRED/PAGE_DELETED/PAGE_SAFE_BLOCK/PAGE_UNKNOWN_SHORT`)，只有`PAGE_SAFE_BLOCK`才停止爬取，其他异常页面均跳过；新增`_classify_page_type()`方法(L940)，重构`_crawl_range()`(L1640)和`_offline_process_post()`(L2345)；修复Discuz删帖页误判为正常的bug（删帖检查移到`id="ct"`之前）
+- 2026-07-12：**两个离线爬取Bug修复** — (1) `_sanitize_dirname()` 未过滤Unicode特殊字符(❤️￥~)导致含这些字符的标题创建目录失败，新增Unicode清理正则；(2) `_update_search_data()` 中`"{}/{}/{}".format(a,b)` 参数数量不匹配(3个占位符只传2个参数)，改为`"{}/{}".format(...)`
 
 ## 数据维护
 - 2026-05-31：数据库去重完成，34115→31518 条，2597 条冗余已删除，磁力链接保存在 magnet_extra
 - 2026-06-14：当前 31859 条（持续增长中）
+- 2026-07-11：欧美片清理完成，删除 1080 条 DB 记录，当前 31321 条
 - mosaic 脏数据：929 条非"有码"/"无码"的值（HTML残留），需要清洗
-- 备份文件：syaA.db.bak（项目根目录），syaA.db.bak2
+- 备份文件：syaA.db.bak（项目根目录），syaA.db.bak2，syaA.db.bak3（欧美片清理前）
 
 ## 代码架构
 - 主文件：src/url/gui_app.py（~8000行），SyaApp 类包含6个Tab
