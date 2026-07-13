@@ -1286,6 +1286,10 @@ class SyaApp:
         self.crawl_threads.insert(0, self.config.get("crawl_threads", "10"))
         self.crawl_threads.pack(side=tk.LEFT, padx=(2, 10))
 
+        # 无码爬取开关（默认不勾选=不爬取无码）
+        self.crawl_allow_uc = tk.BooleanVar(value=self.config.get("crawl_allow_uc", False))
+        ttk.Checkbutton(row, text="爬取无码", variable=self.crawl_allow_uc).pack(side=tk.LEFT, padx=(2, 10))
+
         ttk.Label(row, text="离线并发页数:").pack(side=tk.LEFT)
         self.offline_concurrent = ttk.Combobox(row, width=4, values=["1", "2", "3", "4"], state="readonly")
         self.offline_concurrent.set(self.config.get("offline_concurrent", "1"))
@@ -1415,7 +1419,7 @@ class SyaApp:
             return
 
         self.crawl_running = True
-        self.crawl_stats = {"new": 0, "exist": 0, "non_cn": 0, "no_magnet": 0, "fail": 0, "other": 0}
+        self.crawl_stats = {"new": 0, "exist": 0, "non_cn": 0, "no_magnet": 0, "fail": 0, "other": 0, "uc_skip": 0}
         self._cookie_invalid_count = 0
         self._crawl_processed = 0
         self._crawl_total = end - begin
@@ -1511,13 +1515,14 @@ class SyaApp:
             self._log("[用户中断] 爬取被用户手动停止")
         else:
             self._log("爬取完成！")
-        self._log("新增: {} | 跳过已存在: {} | 非中文: {} | 无磁力: {} | 请求失败: {} | 其他跳过: {}".format(
+        self._log("新增: {} | 跳过已存在: {} | 非中文: {} | 无磁力: {} | 请求失败: {} | 其他跳过: {} | 无码跳过: {}".format(
             self.crawl_stats["new"],
             self.crawl_stats["exist"],
             self.crawl_stats["non_cn"],
             self.crawl_stats["no_magnet"],
             self.crawl_stats["fail"],
             self.crawl_stats["other"],
+            self.crawl_stats.get("uc_skip", 0),
         ))
         self._log("进度: {}/{} ({}个帖子已处理)".format(
             sum(self.crawl_stats.values()), total, sum(self.crawl_stats.values())))
@@ -1908,6 +1913,12 @@ class SyaApp:
                 self._log("[欧美] [SKIP] 跳过欧美片 | {} | 番号: {}".format(next_url, designation))
                 self.crawl_stats.setdefault("western_skip", 0)
                 self.crawl_stats["western_skip"] += 1
+                continue
+
+            # 10.6 无码视频跳过（GUI开关控制，默认不勾选=不爬取无码）
+            if cn_type == "无码破解" and not self.crawl_allow_uc.get():
+                self._log("[无码] [SKIP] 跳过无码视频（未开启无码爬取开关）| {} | 番号: {}".format(next_url, fanhao))
+                self.crawl_stats["uc_skip"] += 1
                 continue
 
             # 11. 写磁力文件
@@ -8628,6 +8639,7 @@ a:hover {{ text-decoration: underline; }}
             self.config["crawl_begin"] = self.crawl_begin.get()
             self.config["crawl_end"] = self.crawl_end.get()
             self.config["crawl_threads"] = self.crawl_threads.get()
+            self.config["crawl_allow_uc"] = str(int(self.crawl_allow_uc.get()))
             self.config["cookie_path"] = self.cookie_path.get()
             self.config["offline_concurrent"] = self.offline_concurrent.get()
             self.config["offline_crawl_begin"] = self.offline_crawl_begin.get()
