@@ -299,10 +299,15 @@ def _append_auto_fields(sql, val, action=None):
     return sql, val
 
 
-def link_db_cmd(sql, val=(), retries=3, action=None):
+def link_db_cmd(sql, val=(), retries=10, action=None):
     """执行单条 SQL 并返回结果，带重试机制。
     对于 UPDATE av 语句，自动追加 updated_at = 当前时间 和 last_action = 动作。
     action: 可选的动作标签字符串。
+
+    重试机制：
+    - 默认重试 10 次，每次等待时间递增（0.5s → 1s → 1.5s ... → 5s）
+    - 总等待时间约 27.5 秒，足够应对普通爬取的长事务写入
+    - 如果仍然失败，会抛出 sqlite3.OperationalError 给调用方处理
     """
     sql, val = _append_auto_fields(sql, val, action=action)
     for attempt in range(retries):
@@ -318,7 +323,8 @@ def link_db_cmd(sql, val=(), retries=3, action=None):
         except sqlite3.OperationalError as e:
             if "locked" in str(e) and attempt < retries - 1:
                 import time
-                time.sleep(0.5 * (attempt + 1))  # 递增等待
+                wait_time = 0.5 * (attempt + 1)
+                time.sleep(wait_time)
                 continue
             raise
 
@@ -1015,6 +1021,9 @@ class SyaApp:
         self._crawl_total = 0  # 总帖子数
         self._crawl_processed_lock = threading.Lock()
 
+        # 普通爬取已爬取记录（JSON文件，支持断点续爬）
+        self._crawled_lock = threading.Lock()  # 爬取记录线程安全锁
+
         # 离线爬取专用
         self._offline_dl_lock = threading.Lock()  # 离线爬取线程安全锁
         self._crawl_verify_post_id = None  # Cookie二次验证用帖号
@@ -1443,6 +1452,7 @@ class SyaApp:
         self.crawl_status.set("正在停止...")
 
     def _crawl_worker(self, begin, end, thread_num):
+        crawled = {}  # [FIX 2026-07-15] 提前初始化，确保 finally 能访问
         total = end - begin
         # 重置爬取状态
         self._crawl_stop_reason = ""
@@ -1461,8 +1471,12 @@ class SyaApp:
 
         # 爬取前验证 Cookie 是否有效：访问一个帖子，检查页面类型
         self._log("正在验证 Cookie 有效性...")
+        # 自动去除协议前缀（防止 https://https:// 重复）
+        raw_host = self.base_url.get().strip().rstrip("/")
+        if raw_host.startswith("http://") or raw_host.startswith("https://"):
+            raw_host = re.sub(r"^https?://", "", raw_host, count=1)
         try:
-            test_url = "https://{}/thread-{}-1-1.html".format(self.base_url.get().strip().rstrip("/"), begin)
+            test_url = "https://{}/thread-{}-1-1.html".format(raw_host, begin)
             test_html = get_url_txt(test_url, cookie)
             test_type = self._classify_page_type(test_html)
             if test_type == PAGE_SAFE_BLOCK:
@@ -1477,56 +1491,89 @@ class SyaApp:
         except Exception as e:
             self._log("[Cookie验证] 请求失败：{}，将继续尝试爬取".format(e))
 
-        # 智能分配线程：实际线程数不超过帖子数
-        actual_threads = min(thread_num, total)
-        if actual_threads < thread_num:
-            self._log("帖子数({})小于线程数({})，调整为 {} 个线程".format(total, thread_num, actual_threads))
+        # 加载已爬取记录（断点续爬）
+        try:
+            crawled = self._load_crawled_json()
+            all_ids = list(range(begin, end))
+            pending_ids = [pid for pid in all_ids if str(pid) not in crawled]
+            skipped_crawled = len(all_ids) - len(pending_ids)
 
-        each_num = total // actual_threads
-        remainder = total % actual_threads
-        threads = []
-        curr = begin
-        for i in range(actual_threads):
-            # 前 remainder 个线程多分配1个帖子，确保不遗漏
-            curr_begin = curr
-            curr_end = curr + each_num + (1 if i < remainder else 0)
-            curr = curr_end
-            t = threading.Thread(
-                target=self._crawl_range,
-                args=(curr_begin, curr_end, cookie),
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
-            self._log("线程 {} 启动：{} - {}（共{}个）".format(i, curr_begin, curr_end, curr_end - curr_begin))
+            if skipped_crawled > 0:
+                self._log("[已爬取] 跳过已处理的 {} 个帖子（从crawled.json加载）".format(skipped_crawled))
+                # [FIX 2026-07-17] 将跳过数计入进度条，避免进度从0%开始而非从已处理位置开始
+                with self._crawl_processed_lock:
+                    self._crawl_processed += skipped_crawled
+                skip_pct = self._crawl_processed * 100 // self._crawl_total if self._crawl_total > 0 else 0
+                self.root.after(0, self._update_progress, skip_pct, self._crawl_processed, self._crawl_total)
+                if len(pending_ids) == 0:
+                    self._log("[已爬取] 范围内所有帖子均已处理，无需爬取")
+                    self.root.after(0, self._crawl_done)
+                    return
 
-        for t in threads:
-            t.join()
+            # 智能分配线程：实际线程数不超过待处理帖子数
+            actual_threads = min(thread_num, len(pending_ids))
+            if actual_threads < thread_num:
+                self._log("待处理帖子数({})小于线程数({})，调整为 {} 个线程".format(len(pending_ids), thread_num, actual_threads))
 
-        # 判断终止原因
-        cookie_invalid = self._cookie_invalid_count >= self._cookie_invalid_threshold
+            each_num = len(pending_ids) // actual_threads
+            remainder = len(pending_ids) % actual_threads
+            threads = []
+            curr_idx = 0
+            for i in range(actual_threads):
+                # 前 remainder 个线程多分配1个帖子，确保不遗漏
+                batch_size = each_num + (1 if i < remainder else 0)
+                batch_ids = pending_ids[curr_idx:curr_idx + batch_size]
+                curr_idx += batch_size
+                t = threading.Thread(
+                    target=self._crawl_range,
+                    args=(batch_ids[0], batch_ids[-1] + 1, cookie, crawled),
+                    daemon=True,
+                )
+                threads.append(t)
+                t.start()
+                self._log("线程 {} 启动：{} - {}（共{}个）".format(i, batch_ids[0], batch_ids[-1], len(batch_ids)))
 
-        # 输出统计
-        self._log("=" * 50)
-        if cookie_invalid:
-            self._log("[Cookie失效] 爬取因Cookie失效而终止！")
-            self._log("[Cookie失效] 请更新Cookie文件后重新爬取")
-        elif not self.crawl_running:
-            self._log("[用户中断] 爬取被用户手动停止")
-        else:
-            self._log("爬取完成！")
-        self._log("新增: {} | 跳过已存在: {} | 非中文: {} | 无磁力: {} | 请求失败: {} | 其他跳过: {} | 无码跳过: {}".format(
-            self.crawl_stats["new"],
-            self.crawl_stats["exist"],
-            self.crawl_stats["non_cn"],
-            self.crawl_stats["no_magnet"],
-            self.crawl_stats["fail"],
-            self.crawl_stats["other"],
-            self.crawl_stats.get("uc_skip", 0),
-        ))
-        self._log("进度: {}/{} ({}个帖子已处理)".format(
-            sum(self.crawl_stats.values()), total, sum(self.crawl_stats.values())))
-        self.root.after(0, self._crawl_done)
+            for t in threads:
+                t.join()
+
+            # 保存已爬取记录（无论正常结束还是中断都要保存，支持断点续爬）
+            self._save_crawled_json(crawled)
+
+            # 判断终止原因
+            cookie_invalid = self._cookie_invalid_count >= self._cookie_invalid_threshold
+
+            # 输出统计
+            self._log("=" * 50)
+            if cookie_invalid:
+                self._log("[Cookie失效] 爬取因Cookie失效而终止！")
+                self._log("[Cookie失效] 请更新Cookie文件后重新爬取")
+            elif not self.crawl_running:
+                self._log("[用户中断] 爬取被用户手动停止")
+            else:
+                self._log("爬取完成！")
+            self._log("新增: {} | 跳过已存在: {} | 非中文: {} | 无磁力: {} | 请求失败: {} | 其他跳过: {} | 无码跳过: {} | 已爬取跳过: {}".format(
+                self.crawl_stats["new"],
+                self.crawl_stats["exist"],
+                self.crawl_stats["non_cn"],
+                self.crawl_stats["no_magnet"],
+                self.crawl_stats["fail"],
+                self.crawl_stats["other"],
+                self.crawl_stats.get("uc_skip", 0),
+                skipped_crawled,
+            ))
+            total_processed = sum(self.crawl_stats.values()) + skipped_crawled
+            self._log("进度: {}/{} ({}个帖子已处理)".format(total_processed, total, total_processed))
+        except Exception as ex:
+            self._log("[异常] _crawl_worker 异常退出: {}".format(str(ex)))
+            import traceback
+            self._log(traceback.format_exc())
+        finally:
+            # 无论正常结束、用户中断还是异常退出，都保存已爬取记录（支持断点续爬 + 防止关闭窗口丢失数据）[FIX 2026-07-15]
+            if crawled:
+                save_count = len(crawled)
+                self._save_crawled_json(crawled)
+                self._log("[已爬取] 已保存 {} 条记录到 crawled.json".format(save_count))
+            self.root.after(0, self._crawl_done)
 
     # 爬取用常量：已知的字段名列表（用于判断值的终止位置）
     _CRAWL_KNOWN_FIELDS = ["影片名称", "出演女优", "影片容量", "是否有码", "种子期限", "下载工具"]
@@ -1711,10 +1758,28 @@ class SyaApp:
         # 所有候选都含【或超长，说明提取有问题，返回默认值
         return default
 
-    def _crawl_range(self, begin, end, cookie):
-        """爬取一个范围的帖子"""
+    def _crawl_range(self, begin, end, cookie, crawled=None):
+        """爬取一个范围的帖子
+
+        Args:
+            begin: 起始帖号（含）
+            end: 结束帖号（不含）
+            cookie: Cookie字典
+            crawled: 已爬取记录字典 {post_id_str: {status, reason, time}}，用于断点续爬
+                     为None时不记录（兼容旧调用）
+        """
         thread_id = threading.current_thread().name
         processed = 0
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 辅助函数：记录已爬取状态（如果crawled字典存在）
+        def _record_crawled(post_id, status, reason=""):
+            if crawled is not None:
+                crawled[str(post_id)] = {
+                    "status": status,
+                    "reason": reason,
+                    "time": now_str,
+                }
 
         for post_id in range(begin, end):
             if not self.crawl_running:
@@ -1734,7 +1799,11 @@ class SyaApp:
             pct = done * 100 // total if total > 0 else 0
             self.root.after(0, self._update_progress, pct, done, total)
 
-            next_url = "https://{}/thread-{}-1-1.html".format(self.base_url.get().strip().rstrip("/"), post_id)
+            # 自动去除用户可能输入的协议前缀（防止 https://https:// 重复）
+            raw_host = self.base_url.get().strip().rstrip("/")
+            if raw_host.startswith("http://") or raw_host.startswith("https://"):
+                raw_host = re.sub(r"^https?://", "", raw_host, count=1)
+            next_url = "https://{}/thread-{}-1-1.html".format(raw_host, post_id)
 
             # 1. 请求页面
             self._log("[{}] >> 处理 post={} | {}".format(thread_id, post_id, next_url))
@@ -1743,6 +1812,7 @@ class SyaApp:
             except Exception as e:
                 self._log("[{}] [FAIL] 请求失败 | {} | 错误: {}".format(thread_id, next_url, e))
                 self.crawl_stats["fail"] += 1
+                _record_crawled(post_id, "fail", str(e))
                 continue
 
             # 检查页面是否有效（使用精确分类器区分不同异常类型）
@@ -1757,6 +1827,7 @@ class SyaApp:
                     self._log("[{}] Cookie已失效，终止爬取 | 已处理 {} 个帖子".format(thread_id, processed))
                     return
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, "safe_block")
                 continue
 
             if page_type in (PAGE_LOGIN_REQUIRED, PAGE_DELETED, PAGE_UNKNOWN_SHORT):
@@ -1770,6 +1841,7 @@ class SyaApp:
                     thread_id, type_text, len(html), next_url,
                     "仅{}字节".format(len(html)) if page_type == PAGE_UNKNOWN_SHORT else ""))
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, type_text.replace(" ", "_"))
                 continue
 
             # 到这里说明是 PAGE_NORMAL 或其他可处理的页面 → 继续原有逻辑
@@ -1791,6 +1863,7 @@ class SyaApp:
             if not mag:
                 self._log("[{}] [SKIP] 无磁力链接 | {}".format(thread_id, next_url))
                 self.crawl_stats["no_magnet"] += 1
+                _record_crawled(post_id, "no_magnet")
                 continue
 
             # 3. 提取标题
@@ -1799,6 +1872,7 @@ class SyaApp:
             if pos1 == -1 or pos2 == -1:
                 self._log("[{}] [SKIP] 无标题标签 | {}".format(thread_id, next_url))
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, "no_title")
                 continue
             title = html[pos1 + 7:pos2]
 
@@ -1820,6 +1894,7 @@ class SyaApp:
                 if not fanhao:
                     self._log("[{}] [SKIP] 无法提取番号 | {} | 标题: {}".format(thread_id, next_url, title[:80]))
                     self.crawl_stats["other"] += 1
+                    _record_crawled(post_id, "no_fanhao")
                     continue
             else:
                 fanhao = cleaned_title[:pos1 - 1].strip()
@@ -1828,6 +1903,7 @@ class SyaApp:
             if len(fanhao) > 80:
                 self._log("[{}] [SKIP] 番号异常过长({}字符) | {} | 番号: {}".format(thread_id, len(fanhao), next_url, fanhao[:80]))
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, "fanhao_too_long")
                 continue
 
             designation = fanhao
@@ -1844,6 +1920,7 @@ class SyaApp:
             else:
                 self._log("[非中文] [SKIP] 跳过 | {} | 标题: {}".format(next_url, title[:80]))
                 self.crawl_stats["non_cn"] += 1
+                _record_crawled(post_id, "non_cn")
                 continue
 
             # 5. 热度
@@ -1913,12 +1990,14 @@ class SyaApp:
                 self._log("[欧美] [SKIP] 跳过欧美片 | {} | 番号: {}".format(next_url, designation))
                 self.crawl_stats.setdefault("western_skip", 0)
                 self.crawl_stats["western_skip"] += 1
+                _record_crawled(post_id, "western_skip", "欧美片: {}".format(designation[:50]))
                 continue
 
             # 10.6 无码视频跳过（GUI开关控制，默认不勾选=不爬取无码）
             if cn_type == "无码破解" and not self.crawl_allow_uc.get():
                 self._log("[无码] [SKIP] 跳过无码视频（未开启无码爬取开关）| {} | 番号: {}".format(next_url, fanhao))
                 self.crawl_stats["uc_skip"] += 1
+                _record_crawled(post_id, "uc_skip", "无码视频: {}".format(fanhao[:50]))
                 continue
 
             # 11. 写磁力文件
@@ -1946,8 +2025,10 @@ class SyaApp:
                     new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
                     link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
                     self._log("[已存在] [合并磁力] 额外磁力已保存到 magnet_extra | {} | 番号: {} | 码制: {}".format(next_url, designation, mosaic))
+                    _record_crawled(post_id, "exist_merge", "已存在(合并磁力): {}".format(designation[:50]))
                 else:
                     self._log("[已存在] [SKIP] 磁力相同，跳过 | {} | 番号: {}".format(next_url, designation))
+                    _record_crawled(post_id, "exist", "已存在: {}".format(designation[:50]))
                 self.crawl_stats["exist"] += 1
                 continue
 
@@ -1986,6 +2067,7 @@ class SyaApp:
                     self._log("  | film_name    = {}".format(film_name[:60]))
                     self._log("  +-------------------------------------------------------------------------")
                     self.crawl_stats["new"] += 1
+                    _record_crawled(post_id, "new", "新增入库: {}".format(designation[:50]))
             except sqlite3.IntegrityError:
                 # 主键冲突（多线程竞态），尝试合并磁力
                 existing = judge_current_film_is_exist(designation)
@@ -1996,10 +2078,13 @@ class SyaApp:
                         new_extra = (existing_extra + "\n" + extra_entry) if existing_extra else extra_entry
                         link_db_cmd("UPDATE av SET magnet_extra = ? WHERE numbers_name = ?", (new_extra, existing_key))
                         self._log("[DUP-MERGE] 合并磁力 | {} | 番号: {}".format(next_url, designation))
+                        _record_crawled(post_id, "dup_merge", "主键冲突(合并磁力): {}".format(designation[:50]))
                     else:
                         self._log("[DUP] 磁力相同，跳过 | {} | 番号: {}".format(next_url, designation))
+                        _record_crawled(post_id, "dup", "主键冲突(磁力相同): {}".format(designation[:50]))
                 else:
                     self._log("[DUP] 数据库已有 | {} | 番号: {}".format(next_url, fanhao))
+                    _record_crawled(post_id, "dup_exist", "主键冲突(已有): {}".format(fanhao[:50]))
                 self.crawl_stats["exist"] += 1
             except UnicodeEncodeError:
                 self._log("[编码异常] [FAIL] | {} | 标题: {}".format(next_url, title[:40]))
@@ -2010,9 +2095,11 @@ class SyaApp:
                 except Exception:
                     pass
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, "unicode_error", "编码异常: {}".format(title[:40]))
             except Exception as e:
                 self._log("[DB错误] [FAIL] 写入失败 | {} | 番号={} | 错误: {}".format(next_url, fanhao, e))
                 self.crawl_stats["other"] += 1
+                _record_crawled(post_id, "db_error", "DB错误: {}".format(str(e)[:50]))
 
         self._log("[{}] 完成，处理了 {} 个帖子".format(thread_id, processed))
 
@@ -2226,6 +2313,40 @@ class SyaApp:
     _OFFLINE_DL_JSON = os.path.join(".", "output", "离线网页", "_downloaded.json")
     _OFFLINE_SRC_ROOT = os.path.join(".", "output", "高清中文字幕网页源文件")
 
+    # 普通爬取已爬取记录（JSON文件，支持断点续爬）
+    _CRAWLED_JSON_PATH = os.path.join(".", "output", "crawled.json")
+
+    def _load_crawled_json(self):
+        """加载普通爬取已爬取记录
+
+        Returns:
+            dict: {post_id_str: {status, reason, time}} 格式的字典
+                  文件不存在或读取失败时返回空字典
+        """
+        with self._crawled_lock:
+            try:
+                if os.path.exists(self._CRAWLED_JSON_PATH):
+                    with open(self._CRAWLED_JSON_PATH, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        return data if isinstance(data, dict) else {}
+                return {}
+            except Exception:
+                return {}
+
+    def _save_crawled_json(self, crawled_data):
+        """保存普通爬取已爬取记录到JSON文件
+
+        Args:
+            crawled_data: {post_id_str: {status, reason, time}} 格式的字典
+        """
+        with self._crawled_lock:
+            try:
+                os.makedirs(os.path.dirname(self._CRAWLED_JSON_PATH), exist_ok=True)
+                with open(self._CRAWLED_JSON_PATH, "w", encoding="utf-8") as f:
+                    json.dump(crawled_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                self._log("[已爬取] 保存记录失败：{}".format(e))
+
     @staticmethod
     def _sanitize_dirname(name):
         """清理目录名中的非法字符（Windows + Unicode 特殊字符），并截断到合理长度"""
@@ -2298,7 +2419,10 @@ class SyaApp:
 
     def _offline_crawl_worker(self, begin, end, concurrent_pages):
         """离线爬取工作线程：并发下载帖子页面及所有资源，保存为本地网页"""
+        # 自动去除协议前缀（防止 https://https:// 重复）
         base = self.base_url.get().strip().rstrip("/")
+        if base.startswith("http://") or base.startswith("https://"):
+            base = re.sub(r"^https?://", "", base, count=1)
         total = end - begin
         self._log("[离线] 开始离线爬取：{} - {}，共 {} 个帖子，并发页数：{}".format(
             begin, end, total, concurrent_pages))
@@ -2772,7 +2896,7 @@ class SyaApp:
             escaped_url = re.escape(orig_url)
             rewritten_html = re.sub(
                 r'((?:zoomfile|file|src)\s*=\s*["\'])' + escaped_url + r'(["\'])',
-                r'\1' + local_rel + r'\2',
+                r'\g<1>' + local_rel + r'\g<2>',  # [FIX 2026-07-13] 使用 \g<> 避免 local_name 以数字开头时反向引用歧义（\1+222→被解析为\122）
                 rewritten_html,
                 flags=re.IGNORECASE,
             )
@@ -2794,7 +2918,7 @@ class SyaApp:
             escaped_url = re.escape(orig_url)
             rewritten_html = re.sub(
                 r'((?:href|src)\s*=\s*["\'])' + escaped_url + r'(["\'])',
-                r'\1' + res_rel_prefix + local_name + r'\2',
+                r'\g<1>' + res_rel_prefix + local_name + r'\g<2>',  # [FIX 2026-07-13] 同上，使用 \g<> 避免歧义
                 rewritten_html,
                 flags=re.IGNORECASE,
             )
@@ -3615,7 +3739,7 @@ function doSearch() {{
         if v["performer"]:
             try:
                 clean_p = _clean_performer(v["performer"])
-                con2 = get_db_conn()
+                con2 = get_db_conn(timeout=3)  # 短超时，避免爬取线程锁竞争导致主线程卡死
                 cur2 = con2.cursor()
                 cur2.execute(
                     "SELECT grade, count(*) FROM av WHERE performer = ? AND grade IS NOT NULL "
@@ -3665,12 +3789,16 @@ function doSearch() {{
                         self.vid_info.insert(tk.END, " {}部\n".format(below_60))
 
                 self.vid_info.insert(tk.END, "本地视频：{}部 | 全量视频：{}部\n".format(p_local, p_total))
+            except sqlite3.OperationalError:
+                # DB被爬取线程锁定时，跳过演员统计而不是卡死主线程
+                self.vid_info.insert(tk.END, SEP + "\n", "sep")
+                self.vid_info.insert(tk.END, "[ 演员统计 - 数据库繁忙 ]\n", "section_title")
             except Exception:
                 pass
 
         # ========== 区块3: 全局统计 ==========
         try:
-            con = get_db_conn()
+            con = get_db_conn(timeout=3)  # 短超时，避免爬取线程锁竞争导致主线程卡死
             cur = con.cursor()
             cur.execute("SELECT count(*) FROM av WHERE local_path IS NOT NULL")
             total = cur.fetchone()[0]
@@ -3902,8 +4030,12 @@ function doSearch() {{
                     self._update_video_info("已撤销：{}".format(action))
 
             self.undo_status.set("")
-        except Exception as e:
-            self._log("[撤销] 失败：{}".format(e))
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                messagebox.showwarning("数据库繁忙", "数据库正被爬取线程占用，请稍后再试")
+                self._log("[撤销] 失败：数据库锁定")
+            else:
+                self._log("[撤销] 失败：{}".format(e))
             self.undo_status.set("撤销失败")
 
     def _play_video(self):
@@ -3938,7 +4070,14 @@ function doSearch() {{
         old_grade = self.cur_video.get("grade", "")
         self.action_history.push("grade", self.cur_video["key"], {"grade": old_grade})
         self.undo_status.set("可撤销: 评分")
-        link_db_cmd("UPDATE av SET grade = ? WHERE numbers_name = ?", (grade, self.cur_video["key"]), action="评分")
+        try:
+            link_db_cmd("UPDATE av SET grade = ? WHERE numbers_name = ?", (grade, self.cur_video["key"]), action="评分")
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                messagebox.showwarning("数据库繁忙", "数据库正被爬取线程占用，请稍后再试")
+                self.undo_status.set("")
+                return
+            raise
         self.cur_video["grade"] = grade
         self._update_video_info("评分完成：{}".format(grade))
 
