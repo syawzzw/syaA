@@ -17,6 +17,9 @@ build/
 # 运行时配置（含本地路径）
 gui_config.json
 
+# 逆地理编码缓存（可随时重建）
+src/tools/.geo_cache.json
+
 # 输出目录（爬虫产物，体积巨大）
 output/
 src/url/output/
@@ -30,6 +33,9 @@ src/url/output/
 
 # 日志
 *.log
+
+# 外源参考素材（第三方项目副本 + 原始压缩包，仅本地参考，不入库）
+外源/
 
 # 临时文件
 overview.md

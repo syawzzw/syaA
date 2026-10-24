@@ -91,3 +91,13 @@
 
 ## 完整项目知识库
 - 已整理到 `PROJECT_KNOWLEDGE.md`（项目根目录），供AI工具切换时无缝过渡
+
+## UI 设计约定（2026-10-24 改版后）
+- 布局骨架：左侧 `_SideNav` 分组导航（抓取/媒体/数据）+ 右侧 `_PageHost` 页面卡片；页面方法内 `tab = self._new_page()` 创建，`self.nb.add(tab, text="页面名")` 注册
+- 页面元信息单一来源：`_PAGE_META = {页面名: (分组, 一句话说明)}`，导航分组与页头副标题都读它；新增页面必须在这里登记
+- 设计令牌：`UI_FONT="Microsoft YaHei UI"`(界面文字) / `MONO_FONT="Consolas"`(番号/磁力/路径/日志) / `PAD_ROW=8` / `PAD_SECTION=12` / `PAGE_PAD=16` / `NAV_WIDTH=176`
+- 配色语义键：`bg`(外壳) / `frame_bg`(卡片) / `nav_bg` / `nav_active_bg` / `border` / `heading_bg` / `hover` / `muted` / `danger` / `accent`，亮暗两套必须同时补齐
+- 按钮样式：`Accent.TButton`(主操作) / `Danger.TButton`(删除类) / `Ghost.TButton`(浏览/取消/清空日志)，由 `_apply_button_hierarchy` 按文案自动归类，不要手写 style 除非加进 `_BTN_EXACT_STYLE`
+- 表格：`ttk.Treeview` 样式统一由 `_apply_theme` 配置（rowheight 26 / Heading 加粗），悬停高亮由 `_apply_treeview_hover` 绑定，行级配色用 tag
+- 主题切换：新控件若用经典 `tk.Text` / `tk.Scrollbar`，必须能被 `_polish_widgets` / `_swap_scrollbars` 覆盖（ScrolledText 会自动处理）
+- 不要在按钮文案里用 emoji（Tk 8.6 显示方块），用字符符号（◐ ◑ ★ ⚠ ↩）

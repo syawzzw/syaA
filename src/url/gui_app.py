@@ -10,6 +10,9 @@ import re
 import time
 import sqlite3
 import os
+import sys
+import asyncio
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
@@ -49,53 +52,126 @@ DEFAULT_CONFIG = {
     "book_root": "https://www.sudugu.org/",
     "book_start": "45",
     "book_end": "99999",
+    "bili_save_dir": "",
+    "bili_cookie": "",
+    "bili_quality": "1080p",
+    "douyin_save_dir": "",
+    "rename_path": "",
     "theme": "light",
     "window_geometry": "",
 }
+
+# ============================================================
+#  外源工具模块（照片重命名 / B站下载器 / 抖音下载器）
+# ============================================================
+TOOLS_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+# 照片重命名核心
+try:
+    import rename_core as rename_core_mod
+    HAS_RENAME_CORE = True
+    RENAME_CORE_ERR = ""
+except Exception as _e:
+    rename_core_mod = None
+    HAS_RENAME_CORE = False
+    RENAME_CORE_ERR = str(_e)
+
+# B站下载器（异步）
+try:
+    from bilibili_downloader.downloader.downloader import (
+        DownloadConfig,
+        download_single_video as bili_download_single,
+        download_user_videos as bili_download_user,
+    )
+    from bilibili_downloader.downloader.api import parse_space_url, parse_video_url
+    HAS_BILI = True
+    BILI_ERR = ""
+except Exception as _e:
+    HAS_BILI = False
+    BILI_ERR = str(_e)
+
+# 抖音下载器（selenium 独立脚本，以子进程方式运行，避免其改写 stdout）
+DOUYIN_SCRIPT = os.path.join(TOOLS_DIR, "douyin_selenium.py")
 
 # ============================================================
 #  主题配色方案（功能12：暗色主题）
 # ============================================================
 THEMES = {
     "light": {
-        "bg": "#F0F0F0",
-        "fg": "#000000",
-        "frame_bg": "#F0F0F0",
+        "bg": "#EEF0F4",          # 外壳底色（导航/内容区之间）
+        "fg": "#1F2328",
+        "frame_bg": "#FFFFFF",    # 卡片底色（页面内容都在这层上）
         "text_bg": "#FFFFFF",
-        "text_fg": "#000000",
-        "button_bg": "#E1E1E1",
-        "button_fg": "#000000",
+        "text_fg": "#1F2328",
+        "button_bg": "#F2F3F5",
+        "button_fg": "#1F2328",
         "entry_bg": "#FFFFFF",
-        "entry_fg": "#000000",
+        "entry_fg": "#1F2328",
         "log_bg": "#FFFFFF",
-        "log_fg": "#000000",
-        "separator": "#C0C0C0",
-        "accent": "#3366CC",
-        "section_title": "#3366CC",
+        "log_fg": "#1F2328",
+        "separator": "#E3E6EA",
+        "accent": "#2F6FEB",
+        "section_title": "#2F6FEB",
         "tag_black": "#CC3333",
         "tag_good": "#00AA00",
         "tag_none": "#888888",
+        # ---- 新增语义色 ----
+        "nav_bg": "#F7F8FA",
+        "nav_fg": "#4A5159",
+        "nav_active_bg": "#E7EFFD",
+        "nav_group_fg": "#9AA0A6",
+        "border": "#DCE0E5",
+        "heading_bg": "#F7F8FA",
+        "heading_fg": "#5B626B",
+        "hover": "#EAF1FB",
+        "muted": "#6B7280",
+        "danger": "#D14343",
     },
     "dark": {
-        "bg": "#1E1E1E",
-        "fg": "#D4D4D4",
-        "frame_bg": "#252526",
-        "text_bg": "#1E1E1E",
-        "text_fg": "#D4D4D4",
-        "button_bg": "#3C3C3C",
-        "button_fg": "#D4D4D4",
-        "entry_bg": "#3C3C3C",
-        "entry_fg": "#D4D4D4",
-        "log_bg": "#1E1E1E",
-        "log_fg": "#D4D4D4",
-        "separator": "#555555",
-        "accent": "#569CD6",
-        "section_title": "#569CD6",
+        "bg": "#18191A",
+        "fg": "#D7DBE0",
+        "frame_bg": "#222325",
+        "text_bg": "#222325",
+        "text_fg": "#D7DBE0",
+        "button_bg": "#2E3033",
+        "button_fg": "#D7DBE0",
+        "entry_bg": "#1C1D1F",
+        "entry_fg": "#D7DBE0",
+        "log_bg": "#222325",
+        "log_fg": "#D7DBE0",
+        "separator": "#35383C",
+        "accent": "#4C8DFF",
+        "section_title": "#6FA8FF",
         "tag_black": "#F44747",
         "tag_good": "#6A9955",
         "tag_none": "#808080",
+        "nav_bg": "#1D1E20",
+        "nav_fg": "#A8AEB6",
+        "nav_active_bg": "#2B3340",
+        "nav_group_fg": "#6B7178",
+        "border": "#33363A",
+        "heading_bg": "#2A2C2F",
+        "heading_fg": "#9BA2AA",
+        "hover": "#2A3442",
+        "muted": "#8A9099",
+        "danger": "#E06060",
     },
 }
+
+# ============================================================
+#  UI 设计令牌（统一字体 / 间距，避免散落的魔法数字）
+# ============================================================
+UI_FONT = "Microsoft YaHei UI"   # 界面文字（含中文）
+UI_FONT_SIZE = 9
+MONO_FONT = "Consolas"           # 番号 / 磁力 / 路径 / 日志
+PAD_ROW = 8                      # 同一区块内行间距
+PAD_SECTION = 12                 # 区块与区块之间
+NAV_WIDTH = 176                  # 左侧导航宽度
+PAGE_PAD = 16                    # 页面内容内边距
 
 # 小说下载索引文件（记录每本书的已下载状态，用于增量更新）
 BOOK_INDEX_FILE = os.path.join(".", "output", "book", "book_index.json")
@@ -131,6 +207,14 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "
 
 # 115 文件白名单
 WHITE_LIST = ["电脑文件备份", "本地照片视频库", "手机备份", "手机相册"]
+
+# 拍平目录：照片/视频扩展名
+FLATTEN_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".jfif"}
+FLATTEN_VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".wmv", ".mov", ".ts", ".m2ts", ".flv", ".webm",
+    ".rmvb", ".rm", ".mpg", ".mpeg", ".3gp", ".m4v", ".vob",
+}
+FLATTEN_MEDIA_EXTS = FLATTEN_PHOTO_EXTS | FLATTEN_VIDEO_EXTS
 
 # 垃圾文件名列表
 DEL_FILE_NAME_LIST = [
@@ -941,6 +1025,186 @@ PAGE_SAFE_BLOCK = "safe_block"
 PAGE_UNKNOWN_SHORT = "unknown_short"
 
 
+# ============================================================
+#  页面元信息：分组 + 一句话说明（导航分组与页头副标题的唯一来源）
+# ============================================================
+_PAGE_META = {
+    "论坛爬取":   ("抓取", "按页码范围抓取论坛帖子，自动识别码制与磁力并入库去重"),
+    "小说爬取":   ("抓取", "流式抓取小说分卷章节，支持分卷级与章节级双层增量"),
+    "B站下载":    ("抓取", "视频 / UP 空间 / 合集下载，支持画质、弹幕与字幕"),
+    "抖音下载":   ("抓取", "借助浏览器会话抓取抖音无水印视频"),
+    "播放视频":   ("媒体", "播放本地视频，评分、加黑名单/关注，查看番号详情"),
+    "磁力生成":   ("媒体", "把番号批量转换成磁力链接"),
+    "照片重命名": ("媒体", "按拍摄时间归档到「年-月」目录，重名自动加后缀"),
+    "拍平目录":   ("媒体", "把子目录里的照片/视频移到顶层，并删除空目录"),
+    "数据库管理": ("数据", "查询、统计、去重与批量维护 syaA.db"),
+    "文件整理":   ("数据", "按关键词或评分清理文件，高分收集与搬运"),
+}
+
+
+# ============================================================
+#  左侧分组导航（替代原来 10 个 Tab 平铺一行）
+# ============================================================
+class _SideNav(tk.Frame):
+    """左侧导航：按分组列出页面，选中项带强调色左边条"""
+
+    def __init__(self, master, colors, on_select):
+        tk.Frame.__init__(self, master, width=NAV_WIDTH, bd=0, highlightthickness=0)
+        self.pack_propagate(False)
+        self.colors = colors
+        self.on_select = on_select
+        self._items = {}      # name -> {row, bar, label}
+        self._headers = []    # 分组标题 Label
+        self._last_group = None
+        self._current = None
+        self._build_brand()
+        self._list = tk.Frame(self, bd=0, highlightthickness=0)
+        self._list.pack(fill=tk.BOTH, expand=True)
+        self.repaint()
+
+    def _build_brand(self):
+        self._brand = tk.Frame(self, bd=0, highlightthickness=0)
+        self._brand.pack(fill=tk.X, padx=16, pady=(16, 8))
+        self._brand_title = tk.Label(self._brand, text="syaA", anchor="w",
+                                     font=(UI_FONT, 13, "bold"))
+        self._brand_title.pack(fill=tk.X)
+        self._brand_desc = tk.Label(self._brand, text="本地媒体工具箱", anchor="w",
+                                    font=(UI_FONT, 8))
+        self._brand_desc.pack(fill=tk.X)
+
+    def add(self, name, group="其他"):
+        """追加一个导航项；group 变化时自动插入分组标题"""
+        if group != self._last_group:
+            header = tk.Label(self._list, text=group, anchor="w", font=(UI_FONT, 8))
+            header.pack(fill=tk.X, padx=18, pady=(10, 2))
+            self._headers.append(header)
+            self._last_group = group
+
+        row = tk.Frame(self._list, bd=0, highlightthickness=0)
+        row.pack(fill=tk.X, padx=8, pady=1)
+        bar = tk.Frame(row, width=3, bd=0, highlightthickness=0)
+        bar.pack(side=tk.LEFT, fill=tk.Y)
+        label = tk.Label(row, text=name, anchor="w", padx=10, pady=6,
+                         font=(UI_FONT, 9), cursor="hand2")
+        label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        for w in (row, label):
+            w.bind("<Button-1>", lambda e, n=name: self.select(n))
+        label.bind("<Enter>", lambda e, n=name: self._hover(n, True))
+        label.bind("<Leave>", lambda e, n=name: self._hover(n, False))
+
+        self._items[name] = {"row": row, "bar": bar, "label": label}
+        if self._current is None:
+            self.select(name)
+        else:
+            self.repaint()
+
+    def _hover(self, name, entering):
+        if name == self._current:
+            return
+        item = self._items.get(name)
+        if not item:
+            return
+        c = self.colors
+        bg = c["hover"] if entering else c["nav_bg"]
+        item["row"].configure(bg=bg)
+        item["label"].configure(bg=bg, fg=c["fg"] if entering else c["nav_fg"])
+
+    def select(self, name):
+        if name not in self._items:
+            return
+        self._current = name
+        self.repaint()
+        if self.on_select:
+            self.on_select(name)
+
+    def apply_colors(self, colors):
+        self.colors = colors
+        self.repaint()
+
+    def repaint(self):
+        c = self.colors
+        self.configure(bg=c["nav_bg"])
+        self._brand.configure(bg=c["nav_bg"])
+        self._brand_title.configure(bg=c["nav_bg"], fg=c["fg"])
+        self._brand_desc.configure(bg=c["nav_bg"], fg=c["nav_group_fg"])
+        self._list.configure(bg=c["nav_bg"])
+        for h in self._headers:
+            h.configure(bg=c["nav_bg"], fg=c["nav_group_fg"])
+        for name, item in self._items.items():
+            active = (name == self._current)
+            bg = c["nav_active_bg"] if active else c["nav_bg"]
+            item["row"].configure(bg=bg)
+            item["bar"].configure(bg=c["accent"] if active else bg)
+            item["label"].configure(bg=bg,
+                                    fg=c["accent"] if active else c["nav_fg"],
+                                    font=(UI_FONT, 9, "bold" if active else "normal"))
+
+
+# ============================================================
+#  右侧内容区：承载页面卡片，兼容原 ttk.Notebook 的 add() 接口
+# ============================================================
+class _PageHost(ttk.Frame):
+    """页面宿主。
+
+    对外保持 `add(frame, text=...)` 签名，因此 10 个 _build_*_tab 无需改动；
+    内部把每个页面包成一张卡片，并自动插入页头（标题 + 一句话说明）。
+    """
+
+    def __init__(self, master, colors, nav):
+        ttk.Frame.__init__(self, master, style="Shell.TFrame")
+        self.colors = colors
+        self.nav = nav
+        self.pages = {}
+        self._headers = {}   # name -> (header, title, desc)
+        self._current = None
+
+    def add(self, tab, text=None, **kw):
+        name = text or "页面"
+        group, desc = _PAGE_META.get(name, ("其他", ""))
+
+        tab.configure(bg=self.colors["frame_bg"],
+                      highlightthickness=1,
+                      highlightbackground=self.colors["border"],
+                      highlightcolor=self.colors["border"])
+
+        header = tk.Frame(tab, bg=self.colors["frame_bg"])
+        title = tk.Label(header, text=name, anchor="w",
+                         bg=self.colors["frame_bg"], fg=self.colors["fg"],
+                         font=(UI_FONT, 13, "bold"))
+        title.pack(fill=tk.X)
+        sub = tk.Label(header, text=desc, anchor="w",
+                       bg=self.colors["frame_bg"], fg=self.colors["muted"],
+                       font=(UI_FONT, 9))
+        sub.pack(fill=tk.X, pady=(2, 0))
+        header.pack(fill=tk.X, padx=10, pady=(10, 8))
+
+        self.pages[name] = tab
+        self._headers[name] = (header, title, sub)
+        self.nav.add(name, group)
+        return tab
+
+    def select(self, name):
+        if name not in self.pages:
+            return
+        if self._current and self._current in self.pages:
+            self.pages[self._current].pack_forget()
+        self.pages[name].pack(fill=tk.BOTH, expand=True,
+                              padx=PAGE_PAD, pady=(PAGE_PAD, PAGE_PAD - 4))
+        self._current = name
+
+    def apply_colors(self, colors):
+        self.colors = colors
+        for name, page in self.pages.items():
+            page.configure(bg=colors["frame_bg"],
+                           highlightbackground=colors["border"],
+                           highlightcolor=colors["border"])
+            header, title, sub = self._headers[name]
+            header.configure(bg=colors["frame_bg"])
+            title.configure(bg=colors["frame_bg"], fg=colors["fg"])
+            sub.configure(bg=colors["frame_bg"], fg=colors["muted"])
+
+
 class SyaApp:
     def __init__(self):
         # 初始化 SQLite 数据库（自动建表）
@@ -952,16 +1216,16 @@ class SyaApp:
         # 加载持久化配置
         self.config = load_config()
 
-        # 恢复窗口大小和位置
+        # 恢复窗口大小和位置（默认值按左侧导航布局加宽）
         win_geom = self.config.get("window_geometry", "")
         if win_geom:
             try:
                 self.root.geometry(win_geom)
             except Exception:
-                self.root.geometry("1100x750")
+                self.root.geometry("1280x820")
         else:
-            self.root.geometry("1100x750")
-        self.root.minsize(900, 600)
+            self.root.geometry(self._default_geometry())
+        self.root.minsize(1040, 660)
 
         # 主题（功能12：暗色主题）
         self.current_theme = self.config.get("theme", "light")
@@ -1040,39 +1304,125 @@ class SyaApp:
         # 115扫描计数器
         self._check_115_count = 0
 
-        self._build_ui()
+        self._hydrate_ui()
         self._poll_log()
 
     # --------------------------------------------------------
     #  主题管理（功能12：暗色主题）
     # --------------------------------------------------------
     def _apply_theme(self):
-        """应用当前主题到 Tk 根窗口"""
+        """应用当前主题：统一字体、控件留白、表格与按钮层级"""
         c = self.theme_colors
         style = ttk.Style()
         style.theme_use("clam")  # clam 主题支持自定义颜色
 
-        style.configure(".", background=c["bg"], foreground=c["fg"])
+        # ---- 全局基础 ----
+        style.configure(".", background=c["frame_bg"], foreground=c["fg"],
+                        font=(UI_FONT, UI_FONT_SIZE), borderwidth=0, focuscolor=c["accent"])
+
         style.configure("TFrame", background=c["frame_bg"])
+        style.configure("Card.TFrame", background=c["frame_bg"])
+        style.configure("Shell.TFrame", background=c["bg"])
+        style.configure("Nav.TFrame", background=c["nav_bg"])
+
         style.configure("TLabel", background=c["frame_bg"], foreground=c["fg"])
-        style.configure("TButton", background=c["button_bg"], foreground=c["button_fg"])
+        style.configure("Muted.TLabel", background=c["frame_bg"],
+                        foreground=c["muted"], font=(UI_FONT, UI_FONT_SIZE))
+        style.configure("PageTitle.TLabel", background=c["bg"],
+                        foreground=c["fg"], font=(UI_FONT, 13, "bold"))
+        style.configure("PageDesc.TLabel", background=c["bg"],
+                        foreground=c["muted"], font=(UI_FONT, 9))
+        style.configure("Hint.TLabel", background=c["frame_bg"],
+                        foreground=c["muted"], font=(UI_FONT, 8))
+        style.configure("Mono.TLabel", background=c["frame_bg"],
+                        foreground=c["fg"], font=(MONO_FONT, UI_FONT_SIZE))
+
+        # ---- 按钮：默认(次) / Accent(主) / Danger(危险) / Ghost(轻) ----
+        style.configure("TButton", background=c["button_bg"], foreground=c["button_fg"],
+                        bordercolor=c["border"], relief="flat", padding=(10, 5))
         style.map("TButton",
-                  background=[("active", c["accent"]), ("pressed", c["accent"])],
-                  foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")])
-        style.configure("TEntry", fieldbackground=c["entry_bg"], foreground=c["entry_fg"])
-        style.configure("TCombobox", fieldbackground=c["entry_bg"], foreground=c["entry_fg"])
-        style.configure("TLabelframe", background=c["frame_bg"], foreground=c["fg"])
-        style.configure("TLabelframe.Label", background=c["frame_bg"], foreground=c["fg"])
-        style.configure("TNotebook", background=c["bg"])
-        style.configure("TNotebook.Tab", background=c["button_bg"], foreground=c["fg"], padding=[8, 4])
-        style.map("TNotebook.Tab",
-                  background=[("selected", c["bg"])],
-                  foreground=[("selected", c["accent"])])
-        style.configure("TCheckbutton", background=c["frame_bg"], foreground=c["fg"])
-        style.configure("TSeparator", background=c["separator"])
-        style.configure("TProgressbar", troughcolor=c["entry_bg"], background=c["accent"])
+                  background=[("pressed", c["border"]), ("active", c["hover"])],
+                  foreground=[("disabled", c["muted"])],
+                  bordercolor=[("active", c["accent"])])
+
+        style.configure("Accent.TButton", background=c["accent"], foreground="#FFFFFF",
+                        bordercolor=c["accent"], relief="flat", padding=(12, 5),
+                        font=(UI_FONT, UI_FONT_SIZE, "bold"))
+        style.map("Accent.TButton",
+                  background=[("disabled", c["border"]), ("pressed", c["accent"]),
+                              ("active", c["accent"])],
+                  foreground=[("disabled", c["muted"])])
+
+        style.configure("Danger.TButton", background=c["button_bg"], foreground=c["danger"],
+                        bordercolor=c["border"], relief="flat", padding=(10, 5))
+        style.map("Danger.TButton",
+                  background=[("active", c["danger"])],
+                  foreground=[("active", "#FFFFFF"), ("disabled", c["muted"])])
+
+        style.configure("Ghost.TButton", background=c["frame_bg"], foreground=c["muted"],
+                        bordercolor=c["border"], relief="flat", padding=(8, 4))
+        style.map("Ghost.TButton",
+                  background=[("active", c["hover"])],
+                  foreground=[("active", c["fg"])])
+
+        # ---- 输入控件 ----
+        style.configure("TEntry", fieldbackground=c["entry_bg"], foreground=c["entry_fg"],
+                        bordercolor=c["border"], insertcolor=c["fg"],
+                        padding=(6, 4), relief="flat")
+        style.map("TEntry", bordercolor=[("focus", c["accent"])])
+        style.configure("TCombobox", fieldbackground=c["entry_bg"], background=c["button_bg"],
+                        foreground=c["entry_fg"], bordercolor=c["border"],
+                        arrowcolor=c["fg"], padding=(6, 3), relief="flat")
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["entry_bg"])],
+                  bordercolor=[("focus", c["accent"])])
+
+        # ---- 分组容器 ----
+        style.configure("TLabelframe", background=c["frame_bg"], bordercolor=c["border"],
+                        relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=c["frame_bg"],
+                        foreground=c["heading_fg"], font=(UI_FONT, UI_FONT_SIZE, "bold"))
+
+        # ---- 表格（之前完全没配，是"土"的主因）----
+        style.configure("Treeview",
+                        background=c["frame_bg"], fieldbackground=c["frame_bg"],
+                        foreground=c["fg"], rowheight=26, borderwidth=0,
+                        font=(UI_FONT, UI_FONT_SIZE))
+        style.map("Treeview",
+                  background=[("selected", c["accent"])],
+                  foreground=[("selected", "#FFFFFF")])
+        style.configure("Treeview.Heading",
+                        background=c["heading_bg"], foreground=c["heading_fg"],
+                        relief="flat", borderwidth=0, padding=(8, 6),
+                        font=(UI_FONT, UI_FONT_SIZE, "bold"))
+        style.map("Treeview.Heading", background=[("active", c["hover"])])
+
+        style.configure("TCheckbutton", background=c["frame_bg"], foreground=c["fg"],
+                        indicatorcolor=c["entry_bg"], padding=(2, 3))
+        style.map("TCheckbutton",
+                  background=[("active", c["frame_bg"])],
+                  indicatorcolor=[("selected", c["accent"])])
+        style.configure("TRadiobutton", background=c["frame_bg"], foreground=c["fg"])
+        style.configure("TSeparator", background=c["border"])
+
+        # ---- 进度条 / 滚动条 ----
+        style.configure("TProgressbar", troughcolor=c["entry_bg"], background=c["accent"],
+                        bordercolor=c["entry_bg"], thickness=8)
+        for orient in ("Vertical", "Horizontal"):
+            style.configure("{}.TScrollbar".format(orient),
+                            background=c["button_bg"], troughcolor=c["text_bg"],
+                            bordercolor=c["text_bg"], arrowcolor=c["muted"],
+                            lightcolor=c["button_bg"], darkcolor=c["button_bg"],
+                            relief="flat", width=10, arrowsize=10)
+            style.map("{}.TScrollbar".format(orient),
+                      background=[("active", c["hover"])])
 
         self.root.configure(bg=c["bg"])
+        # 导航与页面卡片由自定义控件绘制，切换主题时同步重绘
+        if hasattr(self, "nav"):
+            self.nav.apply_colors(c)
+        if hasattr(self, "nb") and hasattr(self.nb, "apply_colors"):
+            self.nb.apply_colors(c)
 
     def _toggle_theme(self):
         """切换亮/暗主题"""
@@ -1083,38 +1433,201 @@ class SyaApp:
         self.theme_colors = THEMES.get(self.current_theme, THEMES["light"])
         self._apply_theme()
 
-        # 更新所有 ScrolledText 的颜色
+        # 更新所有经典 tk 控件（Text / Scrollbar）
         c = self.theme_colors
-        for widget_name in ["log_text", "vid_info", "db_result", "magnet_text", "book_result", "crawl_result"]:
-            w = getattr(self, widget_name, None)
-            if w:
-                try:
-                    w.configure(bg=c["text_bg"], fg=c["text_fg"],
-                                insertbackground=c["text_fg"],
-                                selectbackground=c["accent"])
-                except Exception:
-                    pass
+        self._polish_widgets()
 
         # 更新视频标签样式
         if hasattr(self, "vid_info"):
             self.vid_info.tag_configure("section_title", foreground=c["section_title"],
-                                        font=("Consolas", 10, "bold"))
+                                        font=(MONO_FONT, 10, "bold"))
             self.vid_info.tag_configure("tag_black", foreground=c["tag_black"],
-                                        font=("Consolas", 10, "bold"))
+                                        font=(MONO_FONT, 10, "bold"))
             self.vid_info.tag_configure("tag_good", foreground=c["tag_good"],
-                                        font=("Consolas", 10, "bold"))
+                                        font=(MONO_FONT, 10, "bold"))
             self.vid_info.tag_configure("tag_none", foreground=c["tag_none"],
-                                        font=("Consolas", 10))
+                                        font=(MONO_FONT, 10))
             self.vid_info.tag_configure("sep", foreground=c["separator"])
             self.vid_info.tag_configure("extra_msg", foreground="#CC6600",
-                                        font=("Consolas", 10, "bold"))
+                                        font=(MONO_FONT, 10, "bold"))
 
         self._log("[主题] 切换为{}主题".format("暗色" if self.current_theme == "dark" else "亮色"))
 
-        # 更新主题按钮文字
+        # 更新主题按钮文字（不用 emoji：Tk 8.6 上会显示成方块）
         if hasattr(self, "btn_theme"):
-            theme_text = "🌙 暗色" if self.current_theme == "light" else "☀ 亮色"
-            self.btn_theme.configure(text=theme_text)
+            self.btn_theme.configure(
+                text="◐ 暗色主题" if self.current_theme == "light" else "◑ 亮色主题")
+
+    # --------------------------------------------------------
+    #  控件遍历（供统一套用配色/样式）
+    # --------------------------------------------------------
+    def _walk_widgets(self, widget):
+        """深度遍历所有子控件（生成器）"""
+        yield widget
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            return
+        for child in children:
+            for w in self._walk_widgets(child):
+                yield w
+
+    def _swap_scrollbars(self):
+        """把 ScrolledText 自带的 tk.Scrollbar 换成 ttk 版本。
+
+        Windows 上经典横向/竖向滚动条由系统主题绘制，configure(bg=...) 无效，
+        暗色主题下会留下一条白条；换 ttk 后才会跟随配色。
+        """
+        for w in list(self._walk_widgets(self.root)):
+            if not isinstance(w, scrolledtext.ScrolledText):
+                continue
+            if getattr(w, "_sya_sb_swapped", False):
+                continue
+            old = getattr(w, "vbar", None)
+            if old is None:
+                continue
+            try:
+                master = old.master
+                side = old.pack_info().get("side", tk.RIGHT)
+                old.pack_forget()
+                old.destroy()
+                new = ttk.Scrollbar(master, orient=tk.VERTICAL, command=w.yview)
+                new.pack(side=side, fill=tk.Y)
+                w.configure(yscrollcommand=new.set)
+                w.vbar = new
+                w._sya_sb_swapped = True
+            except Exception:
+                continue
+
+    def _polish_widgets(self, root_widget=None):
+        """经典 tk 控件（Text / Scrollbar）不认 ttk 样式，统一手动上色。
+
+        新页面里大量使用 ScrolledText，它的滚动条是 tk.Scrollbar，
+        不处理的话切暗色主题后会留一条扎眼的白条。
+        """
+        c = self.theme_colors
+        root_widget = root_widget or self.root
+        for w in self._walk_widgets(root_widget):
+            cls = w.winfo_class()
+            if cls == "Text":
+                try:
+                    w.configure(bg=c["text_bg"], fg=c["text_fg"],
+                                insertbackground=c["text_fg"],
+                                selectbackground=c["accent"], selectforeground="#FFFFFF",
+                                relief=tk.FLAT, borderwidth=0,
+                                highlightthickness=1,
+                                highlightbackground=c["border"],
+                                highlightcolor=c["border"],
+                                padx=8, pady=6)
+                    # ScrolledText 的内部容器默认是系统灰，露在滚动条旁边很难看
+                    if isinstance(w.master, tk.Frame):
+                        w.master.configure(bg=c["text_bg"])
+                except Exception:
+                    pass
+            elif cls == "Scrollbar":
+                try:
+                    # tk.Scrollbar：background 是滑槽底色，troughcolor 才是滑块
+                    w.configure(bg=c["text_bg"], troughcolor=c["button_bg"],
+                                activebackground=c["hover"],
+                                borderwidth=0, highlightthickness=0)
+                except Exception:
+                    pass
+
+    # --------------------------------------------------------
+    #  按钮层级：按文案自动归类（主操作/危险/轻操作）
+    # --------------------------------------------------------
+    _BTN_EXACT_STYLE = {
+        "清空日志": "Ghost.TButton",
+        "爬取": "TButton",
+        "随机NoZZZ": "TButton",
+        "随机All": "TButton",
+        "浏览...": "Ghost.TButton",
+        "关闭": "Ghost.TButton",
+        "取消": "Ghost.TButton",
+        "复制磁力链接": "Ghost.TButton",
+        "保存到文件": "Ghost.TButton",
+        "导出JSON": "Ghost.TButton",
+        "导入JSON": "Ghost.TButton",
+        "选择Cookie文件...": "Ghost.TButton",
+        "★加关注": "Ghost.TButton",
+        "⚠加黑名单": "Danger.TButton",
+        "移出黑名单": "Ghost.TButton",
+        "移出关注": "Ghost.TButton",
+        "↩撤销": "Ghost.TButton",
+        "停止": "Danger.TButton",
+        "清空": "Danger.TButton",
+    }
+    _BTN_DANGER_HINTS = ("删除", "清理", "去重", "移除", "停止")
+    _BTN_PRIMARY_HINTS = ("开始", "爬取", "生成磁力", "执行", "预览", "方案", "一键整理",
+                          "高分收集", "刷新115", "评分", "播放", "搬运", "全部白名单",
+                          "全站", "更新小说")
+
+    def _style_for_button(self, text):
+        """根据按钮文案推断层级样式"""
+        text = (text or "").strip()
+        if text in self._BTN_EXACT_STYLE:
+            return self._BTN_EXACT_STYLE[text]
+        if any(h in text for h in self._BTN_DANGER_HINTS):
+            return "Danger.TButton"
+        if any(h in text for h in self._BTN_PRIMARY_HINTS):
+            return "Accent.TButton"
+        return "TButton"
+
+    def _apply_button_hierarchy(self, root_widget=None):
+        """给窗口内所有按钮套用层级样式（单一规则，新增页面自动生效）"""
+        root_widget = root_widget or self.root
+        for w in self._walk_widgets(root_widget):
+            if isinstance(w, ttk.Button):
+                try:
+                    style = self._style_for_button(w.cget("text"))
+                    if style != "TButton":
+                        w.configure(style=style)
+                except Exception:
+                    pass
+
+    def _apply_treeview_hover(self, root_widget=None):
+        """表格悬停高亮：没有 zebra 也能看出当前行"""
+        root_widget = root_widget or self.root
+        c = self.theme_colors
+        for w in self._walk_widgets(root_widget):
+            if not isinstance(w, ttk.Treeview):
+                continue
+            if getattr(w, "_sya_hover_bound", False):
+                continue
+            w._sya_hover_bound = True
+            w.tag_configure("_sya_hover", background=c["hover"])
+
+            def on_motion(event, tree=w):
+                row = tree.identify_row(event.y)
+                for item in getattr(tree, "_sya_hover_rows", ()): 
+                    if item != row:
+                        try:
+                            tree.item(item, tags=[t for t in tree.item(item, "tags") if t != "_sya_hover"])
+                        except Exception:
+                            pass
+                if row:
+                    try:
+                        tags = list(tree.item(row, "tags"))
+                        if "_sya_hover" not in tags:
+                            tags.append("_sya_hover")
+                            tree.item(row, tags=tags)
+                    except Exception:
+                        pass
+                    if tree.cget("cursor") != "hand2":
+                        tree.configure(cursor="hand2")
+                tree._sya_hover_rows = [row] if row else []
+
+            def on_leave(event, tree=w):
+                for item in getattr(tree, "_sya_hover_rows", []):
+                    try:
+                        tree.item(item, tags=[t for t in tree.item(item, "tags") if t != "_sya_hover"])
+                    except Exception:
+                        pass
+                tree._sya_hover_rows = []
+
+            w.bind("<Motion>", on_motion, add="+")
+            w.bind("<Leave>", on_leave, add="+")
+
 
     # --------------------------------------------------------
     #  UI 构建
@@ -1157,38 +1670,103 @@ class SyaApp:
             return True
         return False
 
-    def _build_ui(self):
-        # 顶部 Notebook
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
+    def _default_geometry(self):
+        """默认窗口尺寸：按屏幕可用尺寸取，避免小屏被裁或大屏太窄"""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+        except Exception:
+            return "1280x820"
+        w = max(1040, min(1440, sw - 220))
+        h = max(660, min(920, sh - 180))
+        return "{}x{}".format(w, h)
 
+    def _new_page(self):
+        """创建一个页面卡片（tk.Frame 便于设置 1px 描边，外观由 _PageHost 统一配置）"""
+        return tk.Frame(self.nb, bd=0, highlightthickness=0,
+                        bg=self.theme_colors["frame_bg"])
+
+    def _hydrate_ui(self):
+        """构建界面，并在构建完成后统一套用设计规则（按钮层级/表格悬停/控件配色）"""
+        self._build_ui()
+        # 统一套用按钮层级、表格悬停与经典控件配色
+        self._apply_button_hierarchy()
+        self._apply_treeview_hover()
+        self._swap_scrollbars()
+        self._polish_widgets()
+
+    def _build_ui(self):
+        # ---- 外壳：左导航 + 右内容区 ----
+        shell = ttk.Frame(self.root, style="Shell.TFrame")
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        self.nav = _SideNav(shell, self.theme_colors, self._on_nav_select)
+        self.nav.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 右列：页面卡片 + 底部日志（日志同属右列，左侧导航才能一竖到底）
+        self._right = ttk.Frame(shell, style="Shell.TFrame")
+        self._right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.nb = _PageHost(self._right, self.theme_colors, self.nav)
+        self.nb.pack(fill=tk.BOTH, expand=True)
+
+        # 构建顺序 === 导航分组顺序（抓取 / 媒体 / 数据）
         self._build_crawl_tab()
+        self._build_book_tab()
+        self._build_bili_tab()
+        self._build_douyin_tab()
         self._build_video_tab()
         self._build_magnet_tab()
+        self._build_rename_tab()
+        self._build_flatten_tab()
         self._build_db_tab()
         self._build_file_tab()
-        self._build_book_tab()
 
-        # 底部日志区
-        log_frame = ttk.LabelFrame(self.root, text="运行日志")
-        log_frame.pack(fill=tk.BOTH, padx=6, pady=6)
+        # ---- 底部日志区（可折叠，不再挤占半屏）----
+        log_frame = ttk.LabelFrame(self._right, text="运行日志", padding=(8, 2, 8, 6))
+        log_frame.pack(fill=tk.X, padx=PAGE_PAD, pady=(0, 8))
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED,
-                                                   font=("Consolas", 9))
+        self._log_body = ttk.Frame(log_frame)
+        self._log_body.pack(fill=tk.X)
+        self.log_text = scrolledtext.ScrolledText(self._log_body, height=7, state=tk.DISABLED,
+                                                   font=(MONO_FONT, 9), relief=tk.FLAT,
+                                                   borderwidth=0)
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        self._log_collapsed = False
 
-        btn_clear_log = ttk.Button(log_frame, text="清空日志", command=self._clear_log)
-        btn_clear_log.pack(anchor=tk.E, pady=2)
+        log_bar = ttk.Frame(log_frame)
+        log_bar.pack(fill=tk.X, pady=(4, 0))
+        self._log_bar = log_bar
+        self._btn_log_toggle = ttk.Button(log_bar, text="收起", width=6,
+                                          style="Ghost.TButton", command=self._toggle_log)
+        self._btn_log_toggle.pack(side=tk.RIGHT)
+        ttk.Button(log_bar, text="清空日志", style="Ghost.TButton",
+                   command=self._clear_log).pack(side=tk.RIGHT, padx=(0, 4))
 
-        # 状态栏
+        # ---- 状态栏 ----
         self._build_statusbar()
+
+    def _toggle_log(self):
+        """收起/展开底部日志"""
+        if self._log_collapsed:
+            self._log_body.pack(fill=tk.X, before=self._log_bar)
+            self._btn_log_toggle.configure(text="收起")
+            self._log_collapsed = False
+        else:
+            self._log_body.pack_forget()
+            self._btn_log_toggle.configure(text="展开")
+            self._log_collapsed = True
+
+    def _on_nav_select(self, name):
+        """导航切换"""
+        self.nb.select(name)
 
     # --------------------------------------------------------
     #  状态栏
     # --------------------------------------------------------
     def _build_statusbar(self):
         """构建底部状态栏"""
-        bar = ttk.Frame(self.root, relief=tk.SUNKEN)
+        bar = ttk.Frame(self.root, relief=tk.FLAT, padding=(0, 4))
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
 
         self._sb_video = tk.StringVar(value="当前: 无")
@@ -1196,19 +1774,19 @@ class SyaApp:
         self._sb_stats = tk.StringVar(value="")
 
         # 左侧：当前视频信息
-        ttk.Label(bar, textvariable=self._sb_video, width=35, anchor=tk.W,
-                  font=("Consolas", 9)).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Label(bar, textvariable=self._sb_video, anchor=tk.W,
+                  font=(UI_FONT, UI_FONT_SIZE)).pack(side=tk.LEFT, padx=(10, 6))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=2)
 
         # 中部：演员标签状态
-        self._sb_tag_label = ttk.Label(bar, textvariable=self._sb_tag, width=18, anchor=tk.W,
-                                        font=("Consolas", 9, "bold"))
+        self._sb_tag_label = ttk.Label(bar, textvariable=self._sb_tag, anchor=tk.W,
+                                        font=(UI_FONT, UI_FONT_SIZE, "bold"))
         self._sb_tag_label.pack(side=tk.LEFT, padx=(4, 2))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=2)
 
         # 右侧：全局统计
         ttk.Label(bar, textvariable=self._sb_stats, anchor=tk.E,
-                  font=("Consolas", 9)).pack(side=tk.RIGHT, padx=(2, 6))
+                  font=(UI_FONT, UI_FONT_SIZE)).pack(side=tk.RIGHT, padx=(6, 12))
 
         # 初始刷新
         self._refresh_statusbar()
@@ -1274,7 +1852,7 @@ class SyaApp:
     # ============ Tab 1: 论坛爬取 ============
     # [ARCH] 如果将来拆分模块，可将 _build_crawl_tab 及其 worker 方法提取到 crawl_tab.py
     def _build_crawl_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="论坛爬取")
 
         row = ttk.Frame(tab)
@@ -1299,16 +1877,11 @@ class SyaApp:
         self.crawl_allow_uc = tk.BooleanVar(value=self.config.get("crawl_allow_uc", False))
         ttk.Checkbutton(row, text="爬取无码", variable=self.crawl_allow_uc).pack(side=tk.LEFT, padx=(2, 10))
 
-        ttk.Label(row, text="离线并发页数:").pack(side=tk.LEFT)
-        self.offline_concurrent = ttk.Combobox(row, width=4, values=["1", "2", "3", "4"], state="readonly")
-        self.offline_concurrent.set(self.config.get("offline_concurrent", "1"))
-        self.offline_concurrent.pack(side=tk.LEFT, padx=(2, 10))
-
         row_url = ttk.Frame(tab)
         row_url.pack(fill=tk.X, padx=10, pady=2)
 
         ttk.Label(row_url, text="目标网站:").pack(side=tk.LEFT)
-        self.base_url = ttk.Entry(row_url, width=35)
+        self.base_url = ttk.Entry(row_url, width=30)
         self.base_url.insert(0, self.config.get("base_url", "plwt.kpqq4.com"))
         self.base_url.pack(side=tk.LEFT, padx=2)
         ttk.Label(row_url, text="(URL格式: https://域名/thread-{帖号}-1-1.html)", foreground="gray").pack(side=tk.LEFT, padx=4)
@@ -1317,7 +1890,7 @@ class SyaApp:
         row2.pack(fill=tk.X, padx=10, pady=2)
 
         ttk.Label(row2, text="Cookie文件:").pack(side=tk.LEFT)
-        self.cookie_path = ttk.Entry(row2, width=55)
+        self.cookie_path = ttk.Entry(row2, width=46)
         self.cookie_path.insert(0, self.config.get("cookie_path", "F:/workbuddy/视频下载器_tengxun/10dd.7qxz7.net_cookies.txt"))
         self.cookie_path.pack(side=tk.LEFT, padx=2)
         ttk.Button(row2, text="选择Cookie文件...", command=self._browse_cookie).pack(side=tk.LEFT, padx=4)
@@ -1340,23 +1913,31 @@ class SyaApp:
         self.crawl_custom_pages.pack(side=tk.LEFT, padx=2)
         ttk.Button(row3, text="爬取", command=self._custom_crawl).pack(side=tk.LEFT, padx=2)
 
-        # 离线爬取按钮
-        ttk.Separator(row3, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.btn_offline_crawl = ttk.Button(row3, text="离线爬取", command=self._start_offline_crawl)
-        self.btn_offline_crawl.pack(side=tk.LEFT, padx=4)
-
         # ── 离线爬取独立帖号（与普通爬取分开记录进度，互不干扰）──
         row_offline_id = ttk.Frame(tab)
         row_offline_id.pack(fill=tk.X, padx=10, pady=(6, 2))
-        ttk.Label(row_offline_id, text="离线起始帖号:").pack(side=tk.LEFT)
+
+        self.btn_offline_crawl = ttk.Button(row_offline_id, text="离线爬取",
+                                            command=self._start_offline_crawl)
+        self.btn_offline_crawl.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(row_offline_id, text="起始帖号:").pack(side=tk.LEFT)
         self.offline_crawl_begin = ttk.Entry(row_offline_id, width=12)
         self.offline_crawl_begin.insert(0, self.config.get("offline_crawl_begin", "3369770"))
         self.offline_crawl_begin.pack(side=tk.LEFT, padx=(2, 10))
-        ttk.Label(row_offline_id, text="离线结束帖号:").pack(side=tk.LEFT)
+        ttk.Label(row_offline_id, text="结束帖号:").pack(side=tk.LEFT)
         self.offline_crawl_end = ttk.Entry(row_offline_id, width=12)
         self.offline_crawl_end.insert(0, self.config.get("offline_crawl_end", "3380551"))
         self.offline_crawl_end.pack(side=tk.LEFT, padx=(2, 10))
-        ttk.Label(row_offline_id, text="(离线爬取使用独立帖号，不影响普通爬取的起止范围)", foreground="gray").pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(row_offline_id, text="并发页数:").pack(side=tk.LEFT)
+        self.offline_concurrent = ttk.Combobox(row_offline_id, width=4,
+                                               values=["1", "2", "3", "4"], state="readonly")
+        self.offline_concurrent.set(self.config.get("offline_concurrent", "1"))
+        self.offline_concurrent.pack(side=tk.LEFT, padx=(2, 10))
+
+        ttk.Label(row_offline_id, text="独立帖号，不影响普通爬取",
+                  style="Hint.TLabel").pack(side=tk.LEFT, padx=4)
 
         # 爬取进度条（独立一行，避免被按钮挤出可视区域）
         row3b = ttk.Frame(tab)
@@ -3595,7 +4176,7 @@ function doSearch() {{
     # ============ Tab 2: 播放视频 ============
     # [ARCH] 如果将来拆分模块，可将 _build_video_tab 及其相关方法提取到 video_tab.py
     def _build_video_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="播放视频")
 
         # 左侧控制面板
@@ -3657,16 +4238,17 @@ function doSearch() {{
                                              values=["番号", "演员", "片名", "关键词"])
         self.vid_search_type.set("番号")
         self.vid_search_type.pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Button(search_frame, text="🔍", width=3, command=self._search_video).pack(side=tk.LEFT)
+        ttk.Button(search_frame, text="搜索", width=6, command=self._search_video).pack(side=tk.LEFT)
 
         self.vid_search_result_label = tk.StringVar(value="")
         ttk.Label(left, textvariable=self.vid_search_result_label,
                   font=("Consolas", 8)).pack(anchor=tk.W, padx=4)
 
         # ── 主题切换 ──
-        theme_text = "🌙 暗色" if self.current_theme == "light" else "☀ 亮色"
-        self.btn_theme = ttk.Button(left, text=theme_text, command=self._toggle_theme)
-        self.btn_theme.pack(fill=tk.X, pady=(4, 1))
+        theme_text = "◐ 暗色主题" if self.current_theme == "light" else "◑ 亮色主题"
+        self.btn_theme = ttk.Button(left, text=theme_text, style="Ghost.TButton",
+                                    command=self._toggle_theme)
+        self.btn_theme.pack(fill=tk.X, pady=(6, 2))
 
         # 右侧信息区
         right = ttk.Frame(tab)
@@ -4178,7 +4760,7 @@ function doSearch() {{
     # ============ Tab 3: 磁力生成 ============
     # [ARCH] 如果将来拆分模块，可将 _build_magnet_tab 及其相关方法提取到 magnet_tab.py
     def _build_magnet_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="磁力生成")
 
         # 第一行：数量 + 排序 + 筛选
@@ -4458,7 +5040,7 @@ function doSearch() {{
     # ============ Tab 4: 数据库管理 ============
     # [ARCH] 如果将来拆分模块，可将 _build_db_tab 及其相关方法提取到 db_tab.py
     def _build_db_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="数据库管理")
 
         btn_frame = ttk.Frame(tab)
@@ -5117,7 +5699,7 @@ function doSearch() {{
     # ============ Tab 5: 文件整理 ============
     # [ARCH] 如果将来拆分模块，可将 _build_file_tab 及其相关方法提取到 file_tab.py
     def _build_file_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="文件整理")
 
         row1 = ttk.Frame(tab)
@@ -5129,61 +5711,70 @@ function doSearch() {{
         self.file_path.pack(side=tk.LEFT, padx=4)
         ttk.Button(row1, text="浏览...", command=self._browse_file_path).pack(side=tk.LEFT, padx=2)
 
-        row2 = ttk.Frame(tab)
-        row2.pack(fill=tk.X, padx=10, pady=2)
+        # ---- 分组1：清理 ----
+        grp_clean = ttk.LabelFrame(tab, text="清理", padding=(10, 6, 10, 8))
+        grp_clean.pack(fill=tk.X, padx=10, pady=(6, 0))
 
-        ttk.Button(row2, text="删除垃圾文件", command=lambda: self._run_file_task("garbage")).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row2, text="删除空文件夹", command=lambda: self._run_file_task("empty")).pack(side=tk.LEFT, padx=4)
+        r = ttk.Frame(grp_clean)
+        r.pack(fill=tk.X)
+        ttk.Button(r, text="删除垃圾文件", command=lambda: self._run_file_task("garbage")).pack(side=tk.LEFT)
+        ttk.Button(r, text="删除空文件夹", command=lambda: self._run_file_task("empty")).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(r, text="删除黑名单演员视频", command=lambda: self._run_file_task("black")).pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(row2, text="小文件阈值(MB):").pack(side=tk.LEFT, padx=(10, 2))
-        self.small_file_mb = ttk.Entry(row2, width=6)
+        r = ttk.Frame(grp_clean)
+        r.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(r, text="小文件阈值(MB):").pack(side=tk.LEFT)
+        self.small_file_mb = ttk.Entry(r, width=6)
         self.small_file_mb.insert(0, self.config.get("small_file_mb", "50"))
-        self.small_file_mb.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row2, text="删除小文件", command=lambda: self._run_file_task("small")).pack(side=tk.LEFT, padx=4)
+        self.small_file_mb.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r, text="删除小文件", command=lambda: self._run_file_task("small")).pack(side=tk.LEFT)
 
-        row3 = ttk.Frame(tab)
-        row3.pack(fill=tk.X, padx=10, pady=2)
-
-        ttk.Button(row3, text="重命名视频", command=lambda: self._run_file_task("rename")).pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(row3, text="目标路径:").pack(side=tk.LEFT, padx=(10, 2))
-        self.file_dst_path = ttk.Entry(row3, width=40)
-        self.file_dst_path.insert(0, self.config.get("file_dst_path", "Z:/115open/Hp/"))
-        self.file_dst_path.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row3, text="搬运视频", command=lambda: self._run_file_task("move")).pack(side=tk.LEFT, padx=4)
-
-        row4 = ttk.Frame(tab)
-        row4.pack(fill=tk.X, padx=10, pady=6)
-
-        ttk.Button(row4, text="删除黑名单演员视频", command=lambda: self._run_file_task("black")).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row4, text="低分阈值:").pack(side=tk.LEFT, padx=(10, 2))
-        self.low_grade_val = ttk.Entry(row4, width=6)
+        ttk.Label(r, text="低分阈值:").pack(side=tk.LEFT, padx=(18, 0))
+        self.low_grade_val = ttk.Entry(r, width=6)
         self.low_grade_val.insert(0, self.config.get("low_grade_val", "50"))
-        self.low_grade_val.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row4, text="删除低分视频", command=lambda: self._run_file_task("lowgrade")).pack(side=tk.LEFT, padx=4)
+        self.low_grade_val.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r, text="删除低分视频", command=lambda: self._run_file_task("lowgrade")).pack(side=tk.LEFT)
 
-        ttk.Label(row4, text="关键词:").pack(side=tk.LEFT, padx=(10, 2))
-        self.keyword_val = ttk.Entry(row4, width=15)
-        self.keyword_val.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row4, text="关键词删除", command=lambda: self._run_file_task("keyword")).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="关键词:").pack(side=tk.LEFT, padx=(18, 0))
+        self.keyword_val = ttk.Entry(r, width=14)
+        self.keyword_val.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r, text="关键词删除", command=lambda: self._run_file_task("keyword")).pack(side=tk.LEFT)
 
-        row5 = ttk.Frame(tab)
-        row5.pack(fill=tk.X, padx=10, pady=2)
-        ttk.Button(row5, text="一键整理流水线(云下载=>Hp)", command=lambda: self._run_file_task("pipeline")).pack(side=tk.LEFT, padx=4)
+        # ---- 分组2：搬运 ----
+        grp_move = ttk.LabelFrame(tab, text="搬运到目标目录", padding=(10, 6, 10, 8))
+        grp_move.pack(fill=tk.X, padx=10, pady=(10, 0))
 
-        row6 = ttk.Frame(tab)
-        row6.pack(fill=tk.X, padx=10, pady=2)
+        r = ttk.Frame(grp_move)
+        r.pack(fill=tk.X)
+        ttk.Label(r, text="目标路径:").pack(side=tk.LEFT)
+        self.file_dst_path = ttk.Entry(r, width=44)
+        self.file_dst_path.insert(0, self.config.get("file_dst_path", "Z:/115open/Hp/"))
+        self.file_dst_path.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r, text="搬运视频", command=lambda: self._run_file_task("move")).pack(side=tk.LEFT)
 
-        ttk.Label(row6, text="高分阈值:").pack(side=tk.LEFT)
-        self.collect_grade = ttk.Entry(row6, width=6)
+        r = ttk.Frame(grp_move)
+        r.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(r, text="重命名视频", command=lambda: self._run_file_task("rename")).pack(side=tk.LEFT)
+        ttk.Button(r, text="一键整理流水线(云下载=>Hp)",
+                   command=lambda: self._run_file_task("pipeline")).pack(side=tk.LEFT, padx=(8, 0))
+
+        # ---- 分组3：高分收集 ----
+        grp_collect = ttk.LabelFrame(tab, text="高分收集", padding=(10, 6, 10, 8))
+        grp_collect.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+        r = ttk.Frame(grp_collect)
+        r.pack(fill=tk.X)
+        ttk.Label(r, text="高分阈值:").pack(side=tk.LEFT)
+        self.collect_grade = ttk.Entry(r, width=6)
         self.collect_grade.insert(0, self.config.get("collect_grade", "90"))
-        self.collect_grade.pack(side=tk.LEFT, padx=2)
-        ttk.Label(row6, text="收集到:").pack(side=tk.LEFT, padx=(8, 2))
-        self.collect_dst_path = ttk.Entry(row6, width=40)
+        self.collect_grade.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(r, text="收集到:").pack(side=tk.LEFT)
+        self.collect_dst_path = ttk.Entry(r, width=40)
         self.collect_dst_path.insert(0, self.config.get("collect_dst_path", ""))
-        self.collect_dst_path.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row6, text="浏览...", command=self._browse_collect_path).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row6, text="高分收集", command=lambda: self._run_file_task("collect_preview")).pack(side=tk.LEFT, padx=4)
+        self.collect_dst_path.pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(r, text="浏览...", command=self._browse_collect_path).pack(side=tk.LEFT)
+        ttk.Button(r, text="高分收集",
+                   command=lambda: self._run_file_task("collect_preview")).pack(side=tk.LEFT, padx=(8, 0))
 
     def _browse_collect_path(self):
         path = filedialog.askdirectory()
@@ -5362,6 +5953,722 @@ function doSearch() {{
                     self._log("[删除] 小于{}MB：{}".format(mb, path + file))
             except FileNotFoundError:
                 pass
+
+    # ==================== 拍平目录 ====================
+
+    def _build_flatten_tab(self):
+        tab = self._new_page()
+        self.nb.add(tab, text="拍平目录")
+
+        row1 = ttk.Frame(tab)
+        row1.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(row1, text="目标目录:").pack(side=tk.LEFT)
+        self.flatten_path = ttk.Entry(row1, width=50)
+        self.flatten_path.insert(0, self.config.get("flatten_path", ""))
+        self.flatten_path.pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="浏览...", command=self._browse_flatten_path).pack(side=tk.LEFT, padx=2)
+
+        row2 = ttk.Frame(tab)
+        row2.pack(fill=tk.X, padx=10, pady=2)
+
+        ttk.Button(row2, text="方案预览", command=self._on_flatten_preview).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="方案执行", command=self._on_flatten_execute).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(
+            row2,
+            text="说明：目标目录下所有子目录的照片/视频移到顶层；重名自动加 _1 后缀；移完删除空目录；跳过白名单目录",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+    def _browse_flatten_path(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.flatten_path.delete(0, tk.END)
+            self.flatten_path.insert(0, path.replace("/", "\\") + "\\")
+
+    def _get_flatten_path(self):
+        path = self.flatten_path.get().strip()
+        if not path:
+            messagebox.showerror("错误", "请选择目标目录")
+            return None
+        if not os.path.isdir(path):
+            messagebox.showerror("错误", "目录不存在：{}".format(path))
+            return None
+        self.config["flatten_path"] = path
+        save_config(self.config)
+        return path
+
+    def _on_flatten_preview(self):
+        path = self._get_flatten_path()
+        if path is None:
+            return
+        self._log("拍平方案预览：{}".format(path))
+        self._run_in_thread(lambda: self._flatten_preview_worker(path))
+
+    def _on_flatten_execute(self):
+        path = self._get_flatten_path()
+        if path is None:
+            return
+        if not messagebox.askyesno(
+            "确认执行",
+            "将把目标目录下所有子目录的照片/视频移动到顶层目录：\n{}\n\n"
+            "重名文件自动加后缀，移完删除空目录。\n确认执行？".format(path)
+        ):
+            return
+        self._log("拍平方案执行：{}".format(path))
+        self._run_in_thread(lambda: self._flatten_execute_worker(path))
+
+    def _flatten_scan(self, root_path):
+        """扫描目录生成拍平方案。
+        返回 (moves, empty_dirs)：
+        moves = [(src, dst, note)]，note 为 "移动" 或 "重名改名"
+        empty_dirs = [dir] 按深度从深到浅排序的可删除空目录列表
+        """
+        root_path = os.path.normpath(root_path)
+
+        # dirpath -> 将被移走的文件名集合
+        media_by_dir = {}
+        all_dirs = set()
+
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # 跳过白名单目录（整个子树不进入，保证其内容不被移动/删除）
+            dirnames[:] = [d for d in dirnames if d not in WHITE_LIST]
+            all_dirs.add(os.path.normpath(dirpath))
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in FLATTEN_MEDIA_EXTS:
+                    media_by_dir.setdefault(os.path.normpath(dirpath), set()).add(fn)
+
+        # 顶层已有名字（含目录名，防止文件移到顶层时与目录撞名）
+        taken = set()
+        try:
+            taken = {n.lower() for n in os.listdir(root_path)}
+        except OSError:
+            pass
+
+        moves = []
+        for d in sorted(media_by_dir.keys()):
+            if d == root_path:
+                continue  # 顶层文件不动
+            for fn in sorted(media_by_dir[d]):
+                src = os.path.join(d, fn)
+                stem, ext = os.path.splitext(fn)
+                name = fn
+                i = 1
+                while name.lower() in taken:
+                    name = "{}_{}{}".format(stem, i, ext)
+                    i += 1
+                taken.add(name.lower())
+                note = "移动" if name == fn else "重名改名"
+                moves.append((src, os.path.join(root_path, name), note))
+
+        # 计算移完后变空的目录（含只剩余空子目录的父目录）
+        def is_empty_after(d):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                return False
+            for e in entries:
+                if e in media_by_dir.get(d, set()):
+                    continue  # 该文件将被移走
+                full = os.path.normpath(os.path.join(d, e))
+                if os.path.isdir(full) and full in all_dirs and is_empty_after(full):
+                    continue  # 空子目录，将被删除
+                return False
+            return True
+
+        empty_dirs = [d for d in all_dirs if d != root_path and is_empty_after(d)]
+        empty_dirs.sort(key=lambda x: x.count(os.sep), reverse=True)
+        top_cnt = len(media_by_dir.get(root_path, set()))
+        return moves, empty_dirs, top_cnt
+
+    def _flatten_preview_worker(self, path):
+        try:
+            moves, empty_dirs, top_cnt = self._flatten_scan(path)
+        except Exception as e:
+            self._log("拍平预览失败：{}".format(e))
+            return
+        if not moves and not empty_dirs:
+            if top_cnt > 0:
+                self._log(
+                    "拍平预览：子目录中没有待移动的照片/视频；"
+                    "顶层已有 {} 个照片/视频（保持不动）".format(top_cnt)
+                )
+            else:
+                self._log("拍平预览：没有需要移动的照片/视频")
+            return
+        if top_cnt > 0:
+            self._log("拍平预览：顶层已有 {} 个照片/视频（保持不动）".format(top_cnt))
+        self.root.after(0, lambda: self._show_flatten_preview(path, moves, empty_dirs, top_cnt))
+
+    def _show_flatten_preview(self, path, moves, empty_dirs, top_cnt=0):
+        """显示拍平方案预览窗口"""
+        win = tk.Toplevel(self.root)
+        win.title("拍平方案预览")
+        win.geometry("980x620")
+        win.transient(self.root)
+        win.grab_set()
+
+        rename_cnt = sum(1 for _, _, note in moves if note == "重名改名")
+        summary = "目录：{} | 移动文件：{} 个（重名改名 {} 个）| 删除空目录：{} 个".format(
+            path, len(moves), rename_cnt, len(empty_dirs)
+        )
+        if top_cnt > 0:
+            summary += " | 顶层已有 {} 个照片/视频保持不动".format(top_cnt)
+        ttk.Label(win, text=summary, wraplength=950, font=("Microsoft YaHei", 10)).pack(
+            anchor=tk.W, padx=10, pady=8
+        )
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        txt = tk.Text(text_frame, wrap=tk.NONE, font=("Consolas", 9))
+        ys = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=txt.yview)
+        xs = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        for src, dst, note in moves:
+            tag = "[改名]" if note == "重名改名" else "[移动]"
+            txt.insert(tk.END, "{} {} => {}\n".format(tag, src, dst))
+        for d in empty_dirs:
+            txt.insert(tk.END, "[删目录] {}\n".format(d))
+        txt.configure(state=tk.DISABLED)
+
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=6)
+
+    def _flatten_execute_worker(self, path):
+        try:
+            moves, empty_dirs, top_cnt = self._flatten_scan(path)
+        except Exception as e:
+            self._log("拍平执行失败（扫描阶段）：{}".format(e))
+            return
+
+        if not moves and not empty_dirs:
+            if top_cnt > 0:
+                self._log(
+                    "拍平执行：子目录中没有待移动的照片/视频；"
+                    "顶层已有 {} 个照片/视频（保持不动）".format(top_cnt)
+                )
+            else:
+                self._log("拍平执行：没有需要处理的文件")
+            return
+
+        self._log("拍平执行：共 {} 个文件待移动，{} 个空目录待删除".format(len(moves), len(empty_dirs)))
+        ok = fail = rename_cnt = 0
+        for idx, (src, dst, note) in enumerate(moves, 1):
+            if not os.path.exists(src):
+                fail += 1
+                self._log("[拍平] 源文件不存在，跳过：{}".format(src))
+                continue
+            # 执行时如果目标又被占用（预览后目录发生变化），重新找空闲名字
+            if os.path.exists(dst):
+                stem, ext = os.path.splitext(dst)
+                i = 1
+                while os.path.exists("{}_{}{}".format(stem, i, ext)):
+                    i += 1
+                dst = "{}_{}{}".format(stem, i, ext)
+                note = "重名改名"
+            try:
+                os.rename(src, dst)
+                ok += 1
+                if note == "重名改名":
+                    rename_cnt += 1
+                    self._log("[拍平-改名] {} => {}".format(src, dst))
+                if idx % 20 == 0:
+                    self._log("拍平进度：{}/{}".format(idx, len(moves)))
+            except OSError as e:
+                fail += 1
+                self._log("[拍平-失败] {}：{}".format(src, e))
+
+        rmdir_ok = rmdir_fail = 0
+        for d in empty_dirs:  # 已按深度从深到浅排序
+            try:
+                os.rmdir(d)
+                rmdir_ok += 1
+            except OSError as e:
+                rmdir_fail += 1
+                self._log("[拍平] 删空目录失败 {}: {}".format(d, e))
+
+        self._log(
+            "拍平执行完成：移动成功 {} 个（其中改名 {} 个），失败 {} 个；"
+            "删空目录成功 {} 个，失败 {} 个".format(ok, rename_cnt, fail, rmdir_ok, rmdir_fail)
+        )
+
+    # ==================== 外源工具：照片重命名 ====================
+
+    def _build_rename_tab(self):
+        tab = self._new_page()
+        self.nb.add(tab, text="照片重命名")
+
+        row1 = ttk.Frame(tab)
+        row1.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(row1, text="目标目录:").pack(side=tk.LEFT)
+        self.rename_path = ttk.Entry(row1, width=58)
+        self.rename_path.insert(0, self.config.get("rename_path", ""))
+        self.rename_path.pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="浏览...", command=self._browse_rename_path).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row1, text="(只扫描该目录第一层文件)").pack(side=tk.LEFT, padx=4)
+
+        row2 = ttk.Frame(tab)
+        row2.pack(fill=tk.X, padx=10, pady=2)
+
+        self.rename_only_gps = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="只处理有GPS的文件", variable=self.rename_only_gps).pack(side=tk.LEFT)
+        ttk.Button(row2, text="预览方案", command=self._on_rename_preview).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(row2, text="执行重命名", command=self._on_rename_execute).pack(side=tk.LEFT, padx=2)
+        self.rename_status = ttk.Label(row2, text="就绪")
+        self.rename_status.pack(side=tk.LEFT, padx=10)
+
+        frame = ttk.Frame(tab)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 8))
+
+        cols = ("状态", "原文件名", "新文件名", "拍摄时间", "位置", "时间来源")
+        widths = (60, 180, 235, 120, 140, 90)
+        self.rename_tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c, w in zip(cols, widths):
+            self.rename_tree.heading(c, text=c)
+            self.rename_tree.column(c, width=w, minwidth=60, anchor=tk.W)
+        self.rename_tree.tag_configure("wait", foreground="#666666")
+        self.rename_tree.tag_configure("done", foreground="#0A8A0A")
+        self.rename_tree.tag_configure("fail", foreground="#C00000")
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.rename_tree.yview)
+        hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.rename_tree.xview)
+        self.rename_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.rename_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        # 横向滚动条按需显示：列总宽装得下就隐藏，避免底边常驻一条灰条
+        def _sync_hsb(_event=None):
+            total = sum(self.rename_tree.column(c, "width") for c in cols)
+            if self.rename_tree.winfo_width() + 2 < total:
+                hsb.grid()
+            else:
+                hsb.grid_remove()
+        self.rename_tree.bind("<Configure>", _sync_hsb, add="+")
+        self.root.after(300, _sync_hsb)
+
+        self.rename_tree.tag_configure("empty", foreground=self.theme_colors["muted"])
+        self.rename_tree.insert("", tk.END, tags=("empty",),
+                                values=("提示", "点「预览方案」生成列表", "", "", "", ""))
+
+        self._rename_plan = []
+
+    def _browse_rename_path(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.rename_path.delete(0, tk.END)
+            self.rename_path.insert(0, path.replace("/", "\\") + "\\")
+
+    def _get_rename_path(self):
+        if not HAS_RENAME_CORE:
+            messagebox.showerror("模块缺失", "照片重命名模块加载失败：{}".format(RENAME_CORE_ERR))
+            return None
+        path = self.rename_path.get().strip()
+        if not path or not os.path.isdir(path):
+            messagebox.showerror("错误", "请选择有效目录")
+            return None
+        self.config["rename_path"] = path
+        save_config(self.config)
+        return path
+
+    def _on_rename_preview(self):
+        path = self._get_rename_path()
+        if path is None:
+            return
+        only_gps = self.rename_only_gps.get()
+        self.rename_status.configure(text="扫描中…")
+        self._log("照片重命名预览：{}".format(path))
+        self._run_in_thread(lambda: self._rename_preview_worker(path, only_gps))
+
+    def _rename_preview_worker(self, path, only_gps):
+        try:
+            def cb(cur, total, action, fname):
+                if cur == 1 or cur % 20 == 0 or cur == total:
+                    self._log("[重命名扫描] {}/{} {}".format(cur, total, fname))
+
+            plan, skipped = rename_core_mod.build_rename_plan(path, only_gps=only_gps, progress_cb=cb)
+            self.root.after(0, lambda: self._show_rename_plan(plan, skipped))
+        except Exception as e:
+            self._log("照片重命名预览失败：{}".format(e))
+            self.root.after(0, lambda: self.rename_status.configure(text="预览失败"))
+
+    def _show_rename_plan(self, plan, skipped):
+        self._rename_plan = plan
+        for row in self.rename_tree.get_children():
+            self.rename_tree.delete(row)
+        for item in plan:
+            self.rename_tree.insert("", tk.END, values=(
+                "待重命名",
+                item["old_name"],
+                "{}\\{}".format(item["year_month"], item["new_name"]),
+                item["datetime"],
+                item["location"] or "",
+                item["source"],
+            ), tags=("wait",))
+        msg = "共 {} 个待重命名".format(len(plan))
+        if skipped:
+            msg += "，{} 个因无GPS跳过".format(len(skipped))
+        self.rename_status.configure(text=msg)
+        self._log("照片重命名预览完成：" + msg)
+
+    def _on_rename_execute(self):
+        if not self._rename_plan:
+            messagebox.showwarning("提示", "请先执行「预览方案」")
+            return
+        if not messagebox.askyesno(
+            "确认执行",
+            "将对 {} 个文件执行重命名（按 年-月 建子目录归档）。\n确认执行？".format(len(self._rename_plan))
+        ):
+            return
+        plan = list(self._rename_plan)
+        self.rename_status.configure(text="执行中…")
+        self._log("开始执行照片重命名，共 {} 个文件".format(len(plan)))
+        self._run_in_thread(lambda: self._rename_exec_worker(plan))
+
+    def _rename_exec_worker(self, plan):
+        results = {}
+
+        def cb(cur, total, action, fname, ok, detail):
+            if ok is True:
+                results[fname] = ("完成", "done")
+            elif ok is False:
+                results[fname] = ("失败", "fail")
+            if cur % 20 == 0 or cur == total:
+                self._log("[重命名执行] {}/{}".format(cur, total))
+
+        try:
+            success, skipped, failed = rename_core_mod.execute_rename(plan, progress_cb=cb)
+            self.root.after(0, lambda: self._rename_exec_done(results, success, skipped, failed))
+        except Exception as e:
+            self._log("照片重命名执行失败：{}".format(e))
+            self.root.after(0, lambda: self.rename_status.configure(text="执行失败"))
+
+    def _rename_exec_done(self, results, success, skipped, failed):
+        # 按顺序刷新表格状态
+        children = self.rename_tree.get_children()
+        for iid in children:
+            vals = list(self.rename_tree.item(iid, "values"))
+            name = vals[1] if len(vals) > 1 else ""
+            if name in results:
+                vals[0], tag = results[name]
+                self.rename_tree.item(iid, values=tuple(vals), tags=(tag,))
+        msg = "完成：成功 {}，已是最新 {}，失败 {}".format(success, skipped, failed)
+        self.rename_status.configure(text=msg)
+        self._log(msg)
+
+    # ==================== 外源工具：B站下载 ====================
+
+    def _build_bili_tab(self):
+        tab = self._new_page()
+        self.nb.add(tab, text="B站下载")
+
+        row1 = ttk.Frame(tab)
+        row1.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(row1, text="链接:").pack(side=tk.LEFT)
+        self.bili_url = ttk.Entry(row1, width=62)
+        self.bili_url.pack(side=tk.LEFT, padx=4)
+        ttk.Label(row1, text="(支持 视频 / UP主空间 / 合集)").pack(side=tk.LEFT, padx=2)
+
+        row2 = ttk.Frame(tab)
+        row2.pack(fill=tk.X, padx=10, pady=2)
+        ttk.Label(row2, text="保存目录:").pack(side=tk.LEFT)
+        self.bili_save_dir = ttk.Entry(row2, width=52)
+        self.bili_save_dir.insert(0, self.config.get("bili_save_dir", os.path.join(os.path.expanduser("~"), "Downloads", "bilibili")))
+        self.bili_save_dir.pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="浏览...", command=self._browse_bili_dir).pack(side=tk.LEFT, padx=2)
+
+        row3 = ttk.Frame(tab)
+        row3.pack(fill=tk.X, padx=10, pady=2)
+        ttk.Label(row3, text="画质:").pack(side=tk.LEFT)
+        self.bili_quality = ttk.Combobox(row3, width=8, state="readonly",
+                                         values=["360p", "480p", "720p", "1080p", "4k"])
+        self.bili_quality.set(self.config.get("bili_quality", "1080p"))
+        self.bili_quality.pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(row3, text="最多下载:").pack(side=tk.LEFT, padx=(10, 2))
+        self.bili_max = ttk.Entry(row3, width=6)
+        self.bili_max.insert(0, "0")
+        self.bili_max.pack(side=tk.LEFT, padx=2)
+        ttk.Label(row3, text="(0=不限)").pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(row3, text="SESSDATA:").pack(side=tk.LEFT)
+        self.bili_cookie = ttk.Entry(row3, width=32)
+        self.bili_cookie.insert(0, self.config.get("bili_cookie", ""))
+        self.bili_cookie.pack(side=tk.LEFT, padx=4)
+
+        row4 = ttk.Frame(tab)
+        row4.pack(fill=tk.X, padx=10, pady=2)
+        self.bili_cover = tk.BooleanVar(value=True)
+        self.bili_folder = tk.BooleanVar(value=True)
+        self.bili_sub = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="下载封面", variable=self.bili_cover).pack(side=tk.LEFT)
+        ttk.Checkbutton(row4, text="按视频建子目录", variable=self.bili_folder).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(row4, text="下载字幕", variable=self.bili_sub).pack(side=tk.LEFT)
+
+        row5 = ttk.Frame(tab)
+        row5.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(row5, text="开始下载", command=self._on_bili_start).pack(side=tk.LEFT)
+        self.bili_status = ttk.Label(row5, text="就绪")
+        self.bili_status.pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(
+            tab,
+            text="说明：Cookie 填 B站 SESSDATA 可下载高清/会员画质；合并音视频需要 ffmpeg（自动从 PATH 查找）。",
+        ).pack(anchor=tk.W, padx=12, pady=(4, 0))
+
+    def _browse_bili_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.bili_save_dir.delete(0, tk.END)
+            self.bili_save_dir.insert(0, path.replace("/", "\\"))
+
+    def _on_bili_start(self):
+        if not HAS_BILI:
+            messagebox.showerror("模块缺失", "B站下载模块加载失败：{}".format(BILI_ERR))
+            return
+        url = self.bili_url.get().strip()
+        if not url:
+            messagebox.showerror("错误", "请输入链接")
+            return
+        save_dir = self.bili_save_dir.get().strip()
+        if not save_dir:
+            messagebox.showerror("错误", "请选择保存目录")
+            return
+        try:
+            max_videos = int(self.bili_max.get().strip() or "0")
+        except ValueError:
+            messagebox.showerror("错误", "最多下载数量必须是整数")
+            return
+
+        self.config["bili_save_dir"] = save_dir
+        self.config["bili_cookie"] = self.bili_cookie.get().strip()
+        self.config["bili_quality"] = self.bili_quality.get()
+        save_config(self.config)
+
+        cfg = DownloadConfig(
+            save_dir=save_dir,
+            download_video=True,
+            download_audio=True,
+            download_cover=self.bili_cover.get(),
+            download_subtitles=self.bili_sub.get(),
+            preferred_quality=self.bili_quality.get(),
+            folder_style=self.bili_folder.get(),
+            max_videos=max_videos,
+            cookie=self.bili_cookie.get().strip(),
+        )
+        self._log("B站下载开始：{}".format(url))
+        self.bili_status.configure(text="下载中…")
+        self._run_in_thread(lambda: self._bili_worker(url, cfg))
+
+    @staticmethod
+    def _fmt_bili_log(msg):
+        """把 [PROGRESS] 协议行转成可读中文，返回 None 表示丢弃"""
+        if not isinstance(msg, str):
+            return str(msg)
+        if "[PROGRESS]" in msg:
+            payload = msg.split("[PROGRESS]", 1)[-1].strip()
+            parts = payload.split("|")
+            tag = parts[0].strip() if parts else ""
+            if tag == "ITEM" and len(parts) >= 3:
+                return "下载中 {}/{}  {}".format(parts[1].strip(), "", parts[2].strip()).replace("/  ", "/ ")
+            if tag == "ITEM_TOTAL" and len(parts) >= 3:
+                return "共 {} 个视频（{}）".format(parts[1].strip(), parts[2].strip())
+            if tag == "STEP":
+                return "步骤：{}".format(parts[1].strip() if len(parts) > 1 else "")
+            return payload
+        if msg.startswith("[USER_INFO]"):
+            return "UP主：{}".format(msg.split("]", 1)[-1].strip())
+        return msg
+
+    def _bili_worker(self, url, cfg):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        def log_fn(msg):
+            line = self._fmt_bili_log(msg)
+            if line:
+                self._log(line)
+
+        try:
+            mid = parse_space_url(url)
+            bvid = parse_video_url(url)
+            if mid:
+                loop.run_until_complete(bili_download_user(mid, cfg, log_fn=log_fn))
+                self.root.after(0, lambda: self.bili_status.configure(text="完成"))
+            elif bvid:
+                loop.run_until_complete(bili_download_single(bvid, cfg, log_fn=log_fn))
+                self.root.after(0, lambda: self.bili_status.configure(text="完成"))
+            else:
+                self._log("无法识别链接格式（支持 视频 / UP主空间 / 合集）")
+                self.root.after(0, lambda: self.bili_status.configure(text="链接无效"))
+        except Exception as e:
+            self._log("B站下载失败：{}".format(e))
+            self.root.after(0, lambda: self.bili_status.configure(text="失败"))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    # ==================== 外源工具：抖音下载 ====================
+
+    def _build_douyin_tab(self):
+        tab = self._new_page()
+        self.nb.add(tab, text="抖音下载")
+
+        row1 = ttk.Frame(tab)
+        row1.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(row1, text="链接:").pack(side=tk.LEFT)
+        self.douyin_url = ttk.Entry(row1, width=62)
+        self.douyin_url.pack(side=tk.LEFT, padx=4)
+        ttk.Label(row1, text="(单个视频 / 用户主页)").pack(side=tk.LEFT, padx=2)
+
+        row2 = ttk.Frame(tab)
+        row2.pack(fill=tk.X, padx=10, pady=2)
+        ttk.Label(row2, text="输出目录:").pack(side=tk.LEFT)
+        self.douyin_save_dir = ttk.Entry(row2, width=52)
+        self.douyin_save_dir.insert(0, self.config.get("douyin_save_dir", os.path.join(os.path.expanduser("~"), "Downloads", "抖音视频")))
+        self.douyin_save_dir.pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="浏览...", command=self._browse_douyin_dir).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row2, text="数量:").pack(side=tk.LEFT, padx=(10, 2))
+        self.douyin_count = ttk.Entry(row2, width=6)
+        self.douyin_count.insert(0, "0")
+        self.douyin_count.pack(side=tk.LEFT, padx=2)
+        ttk.Label(row2, text="(0=全部)").pack(side=tk.LEFT, padx=2)
+
+        row3 = ttk.Frame(tab)
+        row3.pack(fill=tk.X, padx=10, pady=6)
+        self.douyin_btn_start = ttk.Button(row3, text="开始下载", command=self._on_douyin_start)
+        self.douyin_btn_start.pack(side=tk.LEFT)
+        self.douyin_btn_stop = ttk.Button(row3, text="停止", command=self._on_douyin_stop, state=tk.DISABLED)
+        self.douyin_btn_stop.pack(side=tk.LEFT, padx=6)
+        self.douyin_status = ttk.Label(row3, text="就绪")
+        self.douyin_status.pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(
+            tab,
+            text="说明：通过 Selenium 驱动本机 Edge 浏览器抓取，无需登录；首次运行会自动下载 msedgedriver。"
+                 "日志输出在下方「运行日志」区。",
+        ).pack(anchor=tk.W, padx=12, pady=(4, 0))
+
+        self._douyin_proc = None
+
+    def _browse_douyin_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.douyin_save_dir.delete(0, tk.END)
+            self.douyin_save_dir.insert(0, path.replace("/", "\\"))
+
+    def _on_douyin_start(self):
+        if not os.path.isfile(DOUYIN_SCRIPT):
+            messagebox.showerror("文件缺失", "找不到抖音下载脚本：{}".format(DOUYIN_SCRIPT))
+            return
+        if self._douyin_proc is not None and self._douyin_proc.poll() is None:
+            messagebox.showwarning("提示", "已有下载任务在运行")
+            return
+        url = self.douyin_url.get().strip()
+        if not url:
+            messagebox.showerror("错误", "请输入链接")
+            return
+        out_dir = self.douyin_save_dir.get().strip()
+        if not out_dir:
+            messagebox.showerror("错误", "请选择输出目录")
+            return
+        try:
+            count = int(self.douyin_count.get().strip() or "0")
+        except ValueError:
+            messagebox.showerror("错误", "数量必须是整数")
+            return
+
+        self.config["douyin_save_dir"] = out_dir
+        save_config(self.config)
+
+        self.douyin_btn_start.configure(state=tk.DISABLED)
+        self.douyin_btn_stop.configure(state=tk.NORMAL)
+        self.douyin_status.configure(text="下载中…")
+        self._log("抖音下载开始：{}".format(url))
+        self._run_in_thread(lambda: self._douyin_worker(url, count, out_dir))
+
+    def _on_douyin_stop(self):
+        proc = self._douyin_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                self._log("抖音下载已请求停止")
+            except Exception as e:
+                self._log("停止失败：{}".format(e))
+        self.douyin_status.configure(text="已停止")
+
+    def _douyin_worker(self, url, count, out_dir):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            self._log("创建输出目录失败：{}".format(e))
+            self.root.after(0, self._douyin_finish)
+            return
+
+        cmd = [sys.executable, DOUYIN_SCRIPT, url, str(count), "-o", out_dir]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=TOOLS_DIR,
+                env=env,
+                bufsize=1,
+                creationflags=creationflags,
+            )
+            self._douyin_proc = proc
+
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip()
+                if not line:
+                    continue
+                # 进度是 \r 刷新的，取最后一段
+                if "\r" in line:
+                    line = [seg for seg in line.split("\r") if seg.strip()][-1].strip()
+                if line:
+                    self._log(line)
+
+            proc.wait()
+            rc = proc.returncode
+            if rc == 0:
+                self._log("抖音下载完成")
+                self.root.after(0, lambda: self.douyin_status.configure(text="完成"))
+            else:
+                self._log("抖音下载结束，退出码 {}".format(rc))
+                self.root.after(0, lambda: self.douyin_status.configure(text="异常退出 {}".format(rc)))
+        except FileNotFoundError as e:
+            self._log("启动失败，请先安装 selenium：pip install selenium -i https://mirrors.aliyun.com/pypi/simple/ （{}）".format(e))
+            self.root.after(0, lambda: self.douyin_status.configure(text="缺少 selenium"))
+        except Exception as e:
+            self._log("抖音下载失败：{}".format(e))
+            self.root.after(0, lambda: self.douyin_status.configure(text="失败"))
+        finally:
+            self._douyin_proc = None
+            self.root.after(0, self._douyin_finish)
+
+    def _douyin_finish(self):
+        self.douyin_btn_start.configure(state=tk.NORMAL)
+        self.douyin_btn_stop.configure(state=tk.DISABLED)
 
     def _rename_worker(self, path):
         try:
@@ -6332,7 +7639,7 @@ a:hover {{ text-decoration: underline; }}
     # ============ Tab 6: 小说爬取 ============
     # [ARCH] 如果将来拆分模块，可将 _build_book_tab 及其相关方法提取到 book_tab.py
     def _build_book_tab(self):
-        tab = ttk.Frame(self.nb)
+        tab = self._new_page()
         self.nb.add(tab, text="小说爬取")
 
         row1 = ttk.Frame(tab)
