@@ -1205,6 +1205,111 @@ class _PageHost(ttk.Frame):
             sub.configure(bg=colors["frame_bg"], fg=colors["muted"])
 
 
+def _fmt_dur(sec):
+    """秒数 → 人类可读时长"""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return "{}s".format(sec)
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return "{}m{:02d}s".format(m, s)
+    h, m = divmod(m, 60)
+    return "{}h{:02d}m".format(h, m)
+
+
+class _ProgressRow(ttk.Frame):
+    """一行实时进度：进度条 + 状态文字。
+
+    worker 线程不直接操作 Tk：状态由 SyaApp._progress_update 写进共享 dict，
+    主线程轮询后调用 render() 渲染。这样 Z 盘上一个文件读 30 秒时，
+    界面也能持续显示「正在处理第 N 个」和已用时间，而不是干等。
+    """
+
+    def __init__(self, master, bar_length=200):
+        super().__init__(master)
+        self.bar = ttk.Progressbar(self, orient=tk.HORIZONTAL, mode="determinate",
+                                   length=bar_length, maximum=100, value=0)
+        self.bar.pack(side=tk.LEFT)
+        self.label = ttk.Label(self, text="", style="Hint.TLabel")
+        self.label.pack(side=tk.LEFT, padx=(10, 0))
+        self._seq = -1
+        self._animating = False
+
+    def _to_determinate(self):
+        if self._animating:
+            self.bar.stop()
+            self._animating = False
+        self.bar.configure(mode="determinate")
+
+    def _to_indeterminate(self):
+        if not self._animating:
+            self.bar.configure(mode="indeterminate")
+            self.bar.start(18)
+            self._animating = True
+
+    def render(self, st):
+        seq = st.get("seq", 0)
+        changed = seq != self._seq
+        self._seq = seq
+
+        phase = st.get("phase", "idle")
+        cur = st.get("cur", 0)
+        total = st.get("total", 0)
+        note = st.get("text", "")
+        t0 = st.get("t0") or 0
+        elapsed = (time.time() - t0) if t0 else 0
+
+        if phase == "idle":
+            if changed:
+                self._to_determinate()
+                self.bar["value"] = 0
+                self.label.configure(text="")
+            return
+
+        if phase == "done":
+            if changed:
+                self._to_determinate()
+                self.bar["maximum"] = max(total, 1)
+                self.bar["value"] = total if total else 1
+                msg = st.get("done") or "完成"
+                if elapsed:
+                    msg += " · 耗时 {}".format(_fmt_dur(elapsed))
+                self.label.configure(text=msg)
+            return
+
+        # phase == "run"
+        if changed:
+            if total <= 0:
+                self._to_indeterminate()
+            else:
+                self._to_determinate()
+                self.bar["maximum"] = total
+                self.bar["value"] = cur
+
+        # 文字每帧重算：单个文件在网盘上卡住时，"已用 25s"仍在走，
+        # 用户能据此判断程序没死，而不是盯着一条不动的日志猜。
+        parts = []
+        if total > 0:
+            parts.append("{}/{}".format(cur, total))
+        else:
+            parts.append("扫描中…")
+        if note:
+            parts.append(note)
+        if elapsed and cur:
+            parts.append("已用 {}".format(_fmt_dur(elapsed)))
+            avg = elapsed / cur
+            stale = time.time() - st.get("upd", time.time())
+            if total > cur:
+                if avg > 0 and stale > max(avg * 5, 5):
+                    # 当前文件明显超出平均耗时：ETA 会一路暴涨，不如直说
+                    parts.append("当前文件较慢，剩余 {} 个".format(total - cur))
+                else:
+                    parts.append("剩余约 {}".format(_fmt_dur(avg * (total - cur))))
+        elif elapsed:
+            parts.append("已用 {}".format(_fmt_dur(elapsed)))
+        self.label.configure(text=" · ".join(parts))
+
+
 class SyaApp:
     def __init__(self):
         # 初始化 SQLite 数据库（自动建表）
@@ -1251,6 +1356,26 @@ class SyaApp:
 
         # 日志队列：子线程写，主线程读
         self.log_queue = queue.Queue()
+
+        # ---- 实时进度 ----
+        # worker 线程只写 _progress_state（加锁），主线程 _poll_progress 读取并渲染，
+        # 避免在子线程里直接操作 Tk 控件。
+        self._progress_state = {}
+        self._progress_rows = {}
+        self._prog_lock = threading.Lock()
+        # worker 线程要执行的 UI 操作（由主线程轮询消费，避免跨线程碰 Tk）
+        self._ui_tasks = queue.Queue()
+        # 全局递增序号：避免同一个 key 第二次运行时序号归零、和上一次撞号而不刷新
+        self._prog_seq = 0
+        # 照片重命名执行：worker 把「已完成的行」写这里，主线程刷到表格
+        self._rename_live = {}
+        self._rename_row_by_name = {}
+        # 日志节流：key -> 上次输出时间
+        self._throttle = {}
+        # 日志文件写盘缓冲（避免每条日志都 open/write）
+        self._logfile_buf = []
+        self._logfile_lock = threading.Lock()
+        self._logfile_last = 0.0
 
         # 运行标志：用于中断爬虫
         self.crawl_running = False
@@ -1306,6 +1431,7 @@ class SyaApp:
 
         self._hydrate_ui()
         self._poll_log()
+        self._poll_progress()
 
     # --------------------------------------------------------
     #  主题管理（功能12：暗色主题）
@@ -5077,6 +5203,152 @@ function doSearch() {{
         t = threading.Thread(target=func, daemon=True)
         t.start()
 
+    # --------------------------------------------------------
+    #  实时进度：worker 只写状态，主线程渲染
+    # --------------------------------------------------------
+    def _post(self, fn):
+        """把 UI 操作投递给主线程执行。
+
+        worker 线程直接调 root.after() 本质是在子线程碰 Tk，
+        正常跑 mainloop 时多数能侥幸工作，但没有 mainloop 或时机不巧会抛
+        "main thread is not in main loop"。这里统一走队列，由主线程消费。
+        """
+        self._ui_tasks.put(fn)
+
+    def _progress_attach(self, key, master, bar_length=200):
+        """在 master 里创建一行进度条并注册（主线程调用）"""
+        row = _ProgressRow(master, bar_length=bar_length)
+        self._progress_rows[key] = row
+        return row
+
+    def _progress_start(self, key, text="扫描中…"):
+        """任务开始：置为运行态，进度条先走不确定动画"""
+        with self._prog_lock:
+            self._prog_seq += 1
+            self._progress_state[key] = {
+                "phase": "run", "cur": 0, "total": 0, "text": text,
+                "t0": time.time(), "upd": time.time(), "seq": self._prog_seq,
+            }
+
+    def _progress_update(self, key, cur=None, total=None, text=None,
+                         phase=None, done=None):
+        """worker 线程调用：只改共享 dict，绝不碰 Tk 控件"""
+        with self._prog_lock:
+            self._prog_seq += 1
+            st = self._progress_state.setdefault(key, {"t0": time.time()})
+            if cur is not None:
+                st["cur"] = cur
+            if total is not None:
+                st["total"] = total
+            if text is not None:
+                st["text"] = text
+            if phase is not None:
+                st["phase"] = phase
+            if done is not None:
+                st["done"] = done
+            st["upd"] = time.time()
+            st["seq"] = self._prog_seq
+
+    def _progress_finish(self, key, text):
+        """任务结束：进度条打满并显示耗时"""
+        self._progress_update(key, phase="done", done=text)
+
+    def _poll_progress(self):
+        """主线程：渲染进度 + 执行 worker 投递的 UI 操作"""
+        # 先跑 worker 投递过来的 UI 操作（预览弹窗、表格填充等）
+        while True:
+            try:
+                fn = self._ui_tasks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+
+        now = time.time()
+        try:
+            for key, row in self._progress_rows.items():
+                with self._prog_lock:
+                    raw = self._progress_state.get(key)
+                    st = dict(raw) if raw else None
+                if st:
+                    row.render(st)
+                    # 心跳：单个文件在网盘上卡住时 worker 不会回调，
+                    # 这里替它报一声，避免日志长时间空白让人以为死了。
+                    if st.get("phase") == "run":
+                        idle_for = now - st.get("upd", now)
+                        if idle_for >= 6:
+                            self._log_throttled(
+                                "hb_" + key,
+                                "[仍在处理] {} · 已用 {}（单个文件在网盘上较慢时属正常）".format(
+                                    st.get("text") or "…",
+                                    _fmt_dur(now - st.get("t0", now))),
+                                6.0)
+        except Exception:
+            pass
+
+        # 照片重命名执行：把刚完成的行实时刷到表格（逐行变绿/变红）
+        try:
+            with self._prog_lock:
+                if self._rename_live:
+                    pending, self._rename_live = self._rename_live, {}
+                else:
+                    pending = None
+            if pending:
+                self._apply_rename_row_states(pending)
+        except Exception:
+            pass
+
+        self.root.after(120, self._poll_progress)
+
+    def _apply_rename_row_states(self, mapping):
+        """按 {原文件名: (状态, tag)} 更新表格行（主线程调用）"""
+        tree = getattr(self, "rename_tree", None)
+        if tree is None:
+            return
+        for name, (state, tag) in mapping.items():
+            iid = self._rename_row_by_name.get(name)
+            if not iid or not tree.exists(iid):
+                continue
+            vals = list(tree.item(iid, "values"))
+            if not vals:
+                continue
+            vals[0] = state
+            tree.item(iid, values=tuple(vals), tags=(tag,))
+            try:
+                tree.see(iid)
+            except Exception:
+                pass
+
+    def _log_throttled(self, key, msg, interval=0.8):
+        """按时间节流的日志：同一 key 最多每 interval 秒输出一条。
+
+        不再用「每 20 个报一次」——Z 盘单文件可能卡 30 秒，
+        按条数节流会出现长时间零反馈；按时间节流则保证每秒都有动静。
+        """
+        now = time.time()
+        if now - self._throttle.get(key, 0) < interval:
+            return False
+        self._throttle[key] = now
+        self._log(msg)
+        return True
+
+    def _log_flush(self):
+        """把攒着的日志一次写盘"""
+        with self._logfile_lock:
+            if not self._logfile_buf:
+                return
+            buf, self._logfile_buf = self._logfile_buf, []
+            self._logfile_last = time.time()
+        try:
+            day_name = time.strftime("%Y-%m-%d")
+            os.makedirs("./output/log", exist_ok=True)
+            with open("./output/log/{}.txt".format(day_name), "a", encoding="utf-8") as f:
+                f.writelines(buf)
+        except Exception:
+            pass
+
     def _run_check_115(self):
         path = self.db_115_path.get().strip()
         if not path:
@@ -5980,6 +6252,10 @@ function doSearch() {{
             text="说明：目标目录下所有子目录的照片/视频移到顶层；重名自动加 _1 后缀；移完删除空目录；跳过白名单目录",
         ).pack(side=tk.LEFT, padx=(10, 0))
 
+        # 实时进度：扫描/移动阶段逐个文件反馈，避免大目录长时间无响应
+        self.flatten_prog = self._progress_attach("flatten", tab, bar_length=220)
+        self.flatten_prog.pack(fill=tk.X, padx=10, pady=(6, 0))
+
     def _browse_flatten_path(self):
         path = filedialog.askdirectory()
         if path:
@@ -6018,26 +6294,41 @@ function doSearch() {{
         self._log("拍平方案执行：{}".format(path))
         self._run_in_thread(lambda: self._flatten_execute_worker(path))
 
-    def _flatten_scan(self, root_path):
+    def _flatten_scan(self, root_path, progress_cb=None):
         """扫描目录生成拍平方案。
-        返回 (moves, empty_dirs)：
+
+        返回 (moves, empty_dirs, top_cnt)：
         moves = [(src, dst, note)]，note 为 "移动" 或 "重名改名"
         empty_dirs = [dir] 按深度从深到浅排序的可删除空目录列表
+
+        progress_cb(stage, cur, total, note)：stage 为 "walk"（遍历目录，total=0 未知）
+        或 "empty"（检测空目录，total=目录总数）。Z 盘上目录多时这一步很慢，
+        没有回调的话界面会长时间毫无反应。
         """
         root_path = os.path.normpath(root_path)
 
         # dirpath -> 将被移走的文件名集合
         media_by_dir = {}
         all_dirs = set()
+        dir_cnt = 0
+        file_cnt = 0
+        last_cb = 0.0
 
         for dirpath, dirnames, filenames in os.walk(root_path):
             # 跳过白名单目录（整个子树不进入，保证其内容不被移动/删除）
             dirnames[:] = [d for d in dirnames if d not in WHITE_LIST]
+            dir_cnt += 1
+            file_cnt += len(filenames)
             all_dirs.add(os.path.normpath(dirpath))
             for fn in filenames:
                 ext = os.path.splitext(fn)[1].lower()
                 if ext in FLATTEN_MEDIA_EXTS:
                     media_by_dir.setdefault(os.path.normpath(dirpath), set()).add(fn)
+            if progress_cb:
+                now = time.time()
+                if now - last_cb >= 0.25:
+                    last_cb = now
+                    progress_cb("walk", dir_cnt, 0, dirpath)
 
         # 顶层已有名字（含目录名，防止文件移到顶层时与目录撞名）
         taken = set()
@@ -6077,18 +6368,52 @@ function doSearch() {{
                 return False
             return True
 
-        empty_dirs = [d for d in all_dirs if d != root_path and is_empty_after(d)]
+        empty_dirs = []
+        total_dirs = len(all_dirs)
+        for checked, d in enumerate(
+            sorted(all_dirs, key=lambda x: x.count(os.sep), reverse=True), 1
+        ):
+            if progress_cb:
+                now = time.time()
+                if now - last_cb >= 0.25 or checked == total_dirs:
+                    last_cb = now
+                    progress_cb("empty", checked, total_dirs, d)
+            if d != root_path and is_empty_after(d):
+                empty_dirs.append(d)
+
         empty_dirs.sort(key=lambda x: x.count(os.sep), reverse=True)
         top_cnt = len(media_by_dir.get(root_path, set()))
         return moves, empty_dirs, top_cnt
 
     def _flatten_preview_worker(self, path):
+        self._progress_start("flatten", "扫描目录中…")
+        self._log("拍平预览：开始扫描 {}".format(path))
+
+        def cb(stage, cur, total, note):
+            if stage == "walk":
+                self._progress_update("flatten", cur=0, total=0,
+                                      text="已遍历 {} 个目录 · {}".format(
+                                          cur, os.path.basename(note) or note))
+                self._log_throttled(
+                    "flat_scan",
+                    "[拍平扫描] 已遍历 {} 个目录，当前：{}".format(cur, note), 1.2)
+            else:
+                self._progress_update("flatten", cur=cur, total=total,
+                                      text="检测空目录 · {}".format(
+                                          os.path.basename(note) or note))
+                self._log_throttled(
+                    "flat_empty",
+                    "[拍平扫描] 检测空目录 {}/{}".format(cur, total), 1.2)
+
         try:
-            moves, empty_dirs, top_cnt = self._flatten_scan(path)
+            moves, empty_dirs, top_cnt = self._flatten_scan(path, progress_cb=cb)
         except Exception as e:
             self._log("拍平预览失败：{}".format(e))
+            self._progress_finish("flatten", "扫描失败")
             return
+
         if not moves and not empty_dirs:
+            self._progress_finish("flatten", "扫描完成，无可处理项")
             if top_cnt > 0:
                 self._log(
                     "拍平预览：子目录中没有待移动的照片/视频；"
@@ -6097,9 +6422,11 @@ function doSearch() {{
             else:
                 self._log("拍平预览：没有需要移动的照片/视频")
             return
+        self._progress_finish(
+            "flatten", "扫描完成：{} 个待移动，{} 个空目录".format(len(moves), len(empty_dirs)))
         if top_cnt > 0:
             self._log("拍平预览：顶层已有 {} 个照片/视频（保持不动）".format(top_cnt))
-        self.root.after(0, lambda: self._show_flatten_preview(path, moves, empty_dirs, top_cnt))
+        self._post(lambda: self._show_flatten_preview(path, moves, empty_dirs, top_cnt))
 
     def _show_flatten_preview(self, path, moves, empty_dirs, top_cnt=0):
         """显示拍平方案预览窗口"""
@@ -6142,13 +6469,29 @@ function doSearch() {{
         ttk.Button(win, text="关闭", command=win.destroy).pack(pady=6)
 
     def _flatten_execute_worker(self, path):
+        self._progress_start("flatten", "扫描目录中…")
+
+        def scan_cb(stage, cur, total, note):
+            if stage == "walk":
+                self._progress_update("flatten", cur=0, total=0,
+                                      text="已遍历 {} 个目录".format(cur))
+                self._log_throttled(
+                    "flat_scan",
+                    "[拍平-扫描] 已遍历 {} 个目录，当前：{}".format(cur, note), 1.2)
+            else:
+                self._progress_update("flatten", cur=cur, total=total,
+                                      text="检测空目录 · {}".format(
+                                          os.path.basename(note) or note))
+
         try:
-            moves, empty_dirs, top_cnt = self._flatten_scan(path)
+            moves, empty_dirs, top_cnt = self._flatten_scan(path, progress_cb=scan_cb)
         except Exception as e:
             self._log("拍平执行失败（扫描阶段）：{}".format(e))
+            self._progress_finish("flatten", "扫描失败")
             return
 
         if not moves and not empty_dirs:
+            self._progress_finish("flatten", "无可处理项")
             if top_cnt > 0:
                 self._log(
                     "拍平执行：子目录中没有待移动的照片/视频；"
@@ -6158,9 +6501,18 @@ function doSearch() {{
                 self._log("拍平执行：没有需要处理的文件")
             return
 
-        self._log("拍平执行：共 {} 个文件待移动，{} 个空目录待删除".format(len(moves), len(empty_dirs)))
+        total_moves = len(moves)
+        total_rmdir = len(empty_dirs)
+        # 整个操作算一条进度（移动 + 删目录），避免阶段切换时进度条倒退
+        total_all = total_moves + total_rmdir
+        self._log("拍平执行：共 {} 个文件待移动，{} 个空目录待删除".format(
+            total_moves, total_rmdir))
         ok = fail = rename_cnt = 0
         for idx, (src, dst, note) in enumerate(moves, 1):
+            base = os.path.basename(src)
+            # 逐个文件刷新进度条（不走日志队列，界面即时变化）
+            self._progress_update("flatten", cur=idx, total=total_all, text=base)
+
             if not os.path.exists(src):
                 fail += 1
                 self._log("[拍平] 源文件不存在，跳过：{}".format(src))
@@ -6179,21 +6531,34 @@ function doSearch() {{
                 if note == "重名改名":
                     rename_cnt += 1
                     self._log("[拍平-改名] {} => {}".format(src, dst))
-                if idx % 20 == 0:
-                    self._log("拍平进度：{}/{}".format(idx, len(moves)))
+                else:
+                    # 普通移动也按秒节流打一条，避免"半天没动静"
+                    self._log_throttled(
+                        "flat_move",
+                        "[拍平] {}/{} 移动 {}".format(idx, total_moves, base), 1.0)
             except OSError as e:
                 fail += 1
                 self._log("[拍平-失败] {}：{}".format(src, e))
 
+        # 删空目录阶段同样给进度（接着移动阶段的进度往后走）
         rmdir_ok = rmdir_fail = 0
-        for d in empty_dirs:  # 已按深度从深到浅排序
+        for idx, d in enumerate(empty_dirs, 1):  # 已按深度从深到浅排序
+            self._progress_update(
+                "flatten", cur=total_moves + idx, total=total_all,
+                text="删除空目录 · {}".format(os.path.basename(d) or d))
             try:
                 os.rmdir(d)
                 rmdir_ok += 1
+                self._log_throttled(
+                    "flat_rmdir",
+                    "[拍平-删目录] {}/{} {}".format(
+                        total_moves + idx, total_all, d), 1.0)
             except OSError as e:
                 rmdir_fail += 1
                 self._log("[拍平] 删空目录失败 {}: {}".format(d, e))
 
+        self._progress_finish(
+            "flatten", "完成：移动 {} 个，删目录 {} 个".format(ok, rmdir_ok))
         self._log(
             "拍平执行完成：移动成功 {} 个（其中改名 {} 个），失败 {} 个；"
             "删空目录成功 {} 个，失败 {} 个".format(ok, rename_cnt, fail, rmdir_ok, rmdir_fail)
@@ -6225,6 +6590,10 @@ function doSearch() {{
         self.rename_status = ttk.Label(row2, text="就绪")
         self.rename_status.pack(side=tk.LEFT, padx=10)
 
+        # 实时进度：Z 盘上单文件可能要读几十秒，靠这条进度条给出"正在跑"的反馈
+        self.rename_prog = self._progress_attach("rename", tab, bar_length=220)
+        self.rename_prog.pack(fill=tk.X, padx=10, pady=(6, 0))
+
         frame = ttk.Frame(tab)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 8))
 
@@ -6237,6 +6606,7 @@ function doSearch() {{
         self.rename_tree.tag_configure("wait", foreground="#666666")
         self.rename_tree.tag_configure("done", foreground="#0A8A0A")
         self.rename_tree.tag_configure("fail", foreground="#C00000")
+        self.rename_tree.tag_configure("skip", foreground="#B07000")
 
         vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.rename_tree.yview)
         hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.rename_tree.xview)
@@ -6291,23 +6661,35 @@ function doSearch() {{
         self._run_in_thread(lambda: self._rename_preview_worker(path, only_gps))
 
     def _rename_preview_worker(self, path, only_gps):
+        self._progress_start("rename", "扫描目录中…")
         try:
             def cb(cur, total, action, fname):
-                if cur == 1 or cur % 20 == 0 or cur == total:
-                    self._log("[重命名扫描] {}/{} {}".format(cur, total, fname))
+                # 进度条逐个文件刷新
+                self._progress_update("rename", cur=cur, total=total,
+                                      text="{} {}".format(action, fname))
+                # 日志按时间节流：Z 盘一个文件可能读 30 秒，按条数节流会长时间静默
+                self._log_throttled(
+                    "rn_scan",
+                    "[重命名扫描] {}/{} {}".format(cur, total, fname), 1.0)
 
             plan, skipped = rename_core_mod.build_rename_plan(path, only_gps=only_gps, progress_cb=cb)
-            self.root.after(0, lambda: self._show_rename_plan(plan, skipped))
+            self._progress_finish(
+                "rename", "扫描完成：{} 个待重命名".format(len(plan)))
+            self._post(lambda: self._show_rename_plan(plan, skipped))
         except Exception as e:
             self._log("照片重命名预览失败：{}".format(e))
-            self.root.after(0, lambda: self.rename_status.configure(text="预览失败"))
+            self._progress_finish("rename", "预览失败")
+            self._post(lambda: self.rename_status.configure(text="预览失败"))
 
     def _show_rename_plan(self, plan, skipped):
         self._rename_plan = plan
+        with self._prog_lock:
+            self._rename_live.clear()
+        self._rename_row_by_name = {}
         for row in self.rename_tree.get_children():
             self.rename_tree.delete(row)
         for item in plan:
-            self.rename_tree.insert("", tk.END, values=(
+            iid = self.rename_tree.insert("", tk.END, values=(
                 "待重命名",
                 item["old_name"],
                 "{}\\{}".format(item["year_month"], item["new_name"]),
@@ -6315,6 +6697,8 @@ function doSearch() {{
                 item["location"] or "",
                 item["source"],
             ), tags=("wait",))
+            # 执行阶段按原文件名 O(1) 定位到行，逐行刷状态
+            self._rename_row_by_name[item["old_name"]] = iid
         msg = "共 {} 个待重命名".format(len(plan))
         if skipped:
             msg += "，{} 个因无GPS跳过".format(len(skipped))
@@ -6337,21 +6721,29 @@ function doSearch() {{
 
     def _rename_exec_worker(self, plan):
         results = {}
+        self._progress_start("rename", "执行中…")
 
         def cb(cur, total, action, fname, ok, detail):
-            if ok is True:
-                results[fname] = ("完成", "done")
-            elif ok is False:
-                results[fname] = ("失败", "fail")
-            if cur % 20 == 0 or cur == total:
-                self._log("[重命名执行] {}/{}".format(cur, total))
+            state = ("完成", "done") if ok is True else (("失败", "fail") if ok is False else ("跳过", "skip"))
+            results[fname] = state
+            # 写进共享表，主线程 120ms 内把这一行刷成绿/红（逐行可见，不等全部结束）
+            with self._prog_lock:
+                self._rename_live[fname] = state
+            self._progress_update("rename", cur=cur, total=total, text=fname)
+            label = "完成" if ok is True else ("失败" if ok is False else "跳过")
+            self._log_throttled(
+                "rn_exec",
+                "[重命名执行] {}/{} {} {}".format(cur, total, label, fname), 1.0)
 
         try:
             success, skipped, failed = rename_core_mod.execute_rename(plan, progress_cb=cb)
-            self.root.after(0, lambda: self._rename_exec_done(results, success, skipped, failed))
+            self._progress_finish(
+                "rename", "完成：成功 {}，跳过 {}，失败 {}".format(success, skipped, failed))
+            self._post(lambda: self._rename_exec_done(results, success, skipped, failed))
         except Exception as e:
             self._log("照片重命名执行失败：{}".format(e))
-            self.root.after(0, lambda: self.rename_status.configure(text="执行失败"))
+            self._progress_finish("rename", "执行失败")
+            self._post(lambda: self.rename_status.configure(text="执行失败"))
 
     def _rename_exec_done(self, results, success, skipped, failed):
         # 按顺序刷新表格状态
@@ -10113,31 +10505,36 @@ a:hover {{ text-decoration: underline; }}
         self.root.destroy()
 
     def _log(self, msg):
-        """线程安全的日志写入"""
+        """线程安全的日志写入（文件写盘攒批，避免每条都 open/write 拖慢 worker）"""
         timestamp = time.strftime("%H:%M:%S")
         self.log_queue.put("[{}] {}".format(timestamp, msg))
-        # 同时写文件日志
-        try:
-            day_name = time.strftime("%Y-%m-%d")
-            os.makedirs("./output/log", exist_ok=True)
-            with open("./output/log/{}.txt".format(day_name), "a", encoding="utf-8") as f:
-                full_time = time.strftime("%Y-%m-%d %H:%M:%S")
-                f.write("[{}] {}\n".format(full_time, msg))
-        except Exception:
-            pass
+        line = "[{}] {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+        with self._logfile_lock:
+            self._logfile_buf.append(line)
+            need_flush = (len(self._logfile_buf) >= 30
+                          or time.time() - self._logfile_last >= 2)
+        if need_flush:
+            self._log_flush()
 
     def _poll_log(self):
         """主线程定时从队列取日志刷新到 Text"""
+        batch = []
         while True:
             try:
-                msg = self.log_queue.get_nowait()
+                batch.append(self.log_queue.get_nowait())
             except queue.Empty:
                 break
+        if batch:
             self.log_text.config(state=tk.NORMAL)
-            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.insert(tk.END, "\n".join(batch) + "\n")
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
-        self.root.after(200, self._poll_log)
+        # 顺便把缓冲的日志落盘（最多积压 2 秒）
+        with self._logfile_lock:
+            pending = bool(self._logfile_buf) and (time.time() - self._logfile_last >= 2)
+        if pending:
+            self._log_flush()
+        self.root.after(150, self._poll_log)
 
     def _clear_log(self):
         self.log_text.config(state=tk.NORMAL)
